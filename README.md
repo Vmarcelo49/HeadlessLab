@@ -12,6 +12,126 @@ HeadlessLab provides a unified Python CLI (`headless`) that lets AI agents and a
 
 ---
 
+## Quick Start (Recommended: Download AppImage — no compilation needed)
+
+The fastest way to get started. Download the pre-built AppImage from GitHub Releases — it contains everything (Wine 10, Mesa llvmpipe, bwrap, the `headless` CLI, and example EXEs) in a single ~253MB file. **No compilation, no `apt-get download`, no `dpkg-deb -x` required.**
+
+### Step 1 — Install host tools (one-time, ~10MB)
+
+HeadlessLab needs a few X11 tools on the host (Xvfb, Openbox, xdotool, etc.). The repo bundles them as `.deb` packages so you can install without sudo:
+
+```bash
+git clone https://github.com/Vmarcelo49/HeadlessLab.git
+cd HeadlessLab
+bash bin/install-host-deps.sh
+source ~/.local/share/headlesslab/env.sh
+```
+
+> **Only Xvfb requires sudo** (it needs kernel DRM access): `sudo apt-get install -y xvfb`
+
+### Step 2 — Download the AppImage
+
+```bash
+# Download the latest release (~253MB)
+curl -sSL -o HeadlessLab.AppImage \
+  https://github.com/Vmarcelo49/HeadlessLab/releases/latest/download/HeadlessLab.AppImage
+chmod +x HeadlessLab.AppImage
+```
+
+### Step 3 — Run
+
+In environments with FUSE (most desktops):
+
+```bash
+./HeadlessLab.AppImage --verify
+# Expected: [OK] Smoke Test PASS! The runtime is working perfectly (62543 colors > 100)!
+```
+
+In environments **without FUSE** (Docker containers, LLM sandboxes, CI):
+
+```bash
+# Pre-extract once (creates squashfs-root/ directory, ~870MB)
+./HeadlessLab.AppImage --appimage-extract
+cd squashfs-root
+export APPDIR="$PWD"
+
+# Run commands from the extracted directory
+./AppRun --verify
+./AppRun init
+./AppRun exec /path/to/app.exe
+```
+
+### Step 4 — Run your own Windows app
+
+```bash
+# From the extracted AppImage directory (or use ./HeadlessLab.AppImage instead of ./AppRun):
+./AppRun init
+# {"status": "ok", "display": ":99", "geometry": "1920x1080x24"}
+
+./AppRun exec /path/to/your-app.exe
+# {"status": "ok", "session_id": "sess_123", "pid": 987, "arch": "x86_64"}
+
+./AppRun wait-window sess_123
+# {"status": "ok", "elapsed_ms": 480}
+
+./AppRun screenshot --session sess_123 --out /tmp/capture.png
+# {"status": "ok", "path": "/tmp/capture.png"}
+
+./AppRun kill sess_123
+# {"status": "ok", "killed_pids": [987, 988, 989, ...]}
+```
+
+---
+
+## Alternative: Build from Source
+
+If you can't use the AppImage (e.g., different architecture, need to modify the code, or want the smallest possible footprint), you can build the Wine prefix from scratch. This downloads ~150MB of `.deb` packages and takes ~5 minutes.
+
+```bash
+git clone https://github.com/Vmarcelo49/HeadlessLab.git
+cd HeadlessLab
+
+# 1. Install host tools (same as Step 1 above)
+bash bin/install-host-deps.sh
+source ~/.local/share/headlesslab/env.sh
+
+# 2. Build the Wine prefix from scratch (~5 min)
+bash bin/build-from-scratch.sh
+
+# 3. (Optional) Add 32-bit (i386) support
+bash bin/setup-32bit.sh
+
+# 4. Verify
+./bin/headless --verify
+```
+
+---
+
+## CLI Reference
+
+Run `headless --help` for the full reference with examples. Here's a summary:
+
+| Command | What it does |
+|---------|-------------|
+| `headless --verify` | Smoke test — verifies the entire stack works |
+| `headless init` | Start virtual display (Xvfb + Openbox) |
+| `headless exec <exe_path>` | Execute a Windows .exe, returns `session_id` + `arch` |
+| `headless wait-window <sess_id>` | Wait for window to appear and pixels to stabilize |
+| `headless screenshot --session <sess_id> --out <path>` | Capture a PNG screenshot |
+| `headless click <x> <y> --session <sess_id>` | Mouse left-click |
+| `headless key <keysym> --session <sess_id>` | Press a key (Return, Escape, ctrl+v, ...) |
+| `headless type "<text>" --session <sess_id>` | Type ASCII text |
+| `headless clipboard --write "<text>" --session <sess_id>` | Write to clipboard (Unicode OK) |
+| `headless accept-dialog <sess_id>` | Press Enter on modal dialogs (EULA, OK/Cancel) |
+| `headless windows --session <sess_id>` | List windows, detect modals |
+| `headless logs <sess_id>` | Get Wine + EXE stdout/stderr (auto UTF-16 decode) |
+| `headless list` | List all sessions |
+| `headless kill <sess_id>` | Kill session and free resources |
+
+**Every command returns a single JSON object to stdout.** Warnings go to stderr. Session cache lives at `~/.cache/headlesslab/`.
+
+---
+
 ## Why HeadlessLab?
 
 Traditional approaches to running Windows apps headless on Linux have painful tradeoffs:
@@ -23,57 +143,30 @@ Traditional approaches to running Windows apps headless on Linux have painful tr
 | `xvfb-run wine app.exe` | No window management, no input simulation, no screenshot stability detection |
 | Proton/Steam | Tied to Steam, ~50GB runtime, not scriptable for arbitrary EXEs |
 
-**HeadlessLab** solves this by bundling Wine 10 + Mesa llvmpipe (software rendering) + Bubblewrap (no-root sandbox) + Xvfb + Openbox into a single CLI that returns JSON. It runs entirely in userspace — `apt-get download` + `dpkg-deb -x` into `~/.local/`, no sudo anywhere.
+**HeadlessLab** solves this by bundling Wine 10 + Mesa llvmpipe (software rendering) + Bubblewrap (no-root sandbox) + Xvfb + Openbox into a single CLI that returns JSON. It runs entirely in userspace — no sudo anywhere (except Xvfb, which needs kernel access).
 
 ---
 
-## Quick Start
+## 32-bit (i386) Windows Binary Support
 
-### Option A — Bundled .deb packages (no sudo, recommended for CI/LLM sandboxes)
+HeadlessLab supports both 64-bit (PE32+ x86-64) and 32-bit (PE32 i386) Windows binaries via Wine's WoW64 mode. The 32-bit support is **opt-in** — if you only need 64-bit, skip this.
+
+**AppImage users:** The AppImage already includes 32-bit support. Skip this section.
+
+**Build-from-source users:**
 
 ```bash
-git clone https://github.com/Vmarcelo49/HeadlessLab.git
-cd HeadlessLab
-
-# 1. Install host tools (openbox, xdotool, wmctrl, xclip, ImageMagick, ...) into ~/.local/
-bash bin/install-host-deps.sh
-source ~/.local/share/headlesslab/env.sh
-
-# 2. Build the Wine prefix (~5 min, downloads ~150MB of .deb packages)
-bash bin/build-from-scratch.sh
-
-# 3. (Optional) Add 32-bit (i386) Windows binary support
 bash bin/setup-32bit.sh
-
-# 4. Verify everything works
-./bin/headless --verify
-# Expected: [OK] Smoke Test PASS! The runtime is working perfectly (62543 colors > 100)!
 ```
 
-### Option B — System-wide install (with sudo, for desktop hosts)
+This downloads `wine32:i386`, `libwine:i386`, and `libc6:i386` from the Debian pool (no sudo, no `dpkg --add-architecture`), patches the 32-bit wine binary's ELF interpreter, and populates `syswow64/` with i386 DLLs. The `headless` CLI auto-detects PE architecture and reports it:
 
 ```bash
-sudo apt update && sudo apt install -y xvfb openbox xdotool wmctrl x11-utils xclip imagemagick \
-    libx11-6 libvulkan1
-python3 -m pip install --user --break-system-packages python-xlib Pillow
-bash bin/build-from-scratch.sh
-./bin/headless --verify
-```
+headless exec hello_win_32.exe
+# {"status": "ok", "session_id": "sess_...", "pid": 12345, "arch": "i386"}
 
-### 3-step usage example
-
-```bash
-# 1. Initialize the virtual display (Xvfb + Openbox WM)
-./bin/headless init
-# {"status": "ok", "display": ":99", "geometry": "1920x1080x24"}
-
-# 2. Execute your Windows application
-./bin/headless exec /path/to/program.exe
-# {"status": "ok", "session_id": "sess_1782847698", "pid": 2177666, "arch": "x86_64"}
-
-# 3. Wait for window stability and capture a screenshot
-./bin/headless wait-window sess_1782847698
-./bin/headless screenshot --session sess_1782847698 --out /tmp/capture.png
+headless exec hello_win.exe
+# {"status": "ok", "session_id": "sess_...", "pid": 12346, "arch": "x86_64"}
 ```
 
 ---
@@ -84,140 +177,27 @@ bash bin/build-from-scratch.sh
 HeadlessLab/
 ├── bin/
 │   ├── headless               # Unified Python CLI (primary entrypoint)
-│   ├── setup.sh               # Host setup script (verifies host + extracts prefix)
+│   ├── setup.sh               # Host setup (verifies host + downloads AppImage if needed)
 │   ├── install-host-deps.sh   # Installs bundled .deb packages into ~/.local/ (no sudo)
-│   ├── setup-32bit.sh         # Adds 32-bit (i386) Windows binary support via Wine WoW64
-│   ├── build-from-scratch.sh  # Rebuilds the Wine prefix from scratch (apt-get download)
+│   ├── setup-32bit.sh         # Adds 32-bit (i386) support (build-from-source only)
+│   ├── build-from-scratch.sh  # Rebuilds the Wine prefix from scratch (~5 min)
 │   ├── pack-appimage.sh       # Packages prefix + CLI into a standalone AppImage
-│   ├── clean-prefix.sh        # Removes non-essential components from prefix
-│   ├── init-wineprefix.sh     # Initializes WINEPREFIX via wineboot
-│   ├── patch-wrappers.sh      # Patches wine64/wineserver wrappers (auto-locate)
-│   ├── rebuild-rootfs.sh      # Creates rootfs/ with symlinks to host
-│   └── symlink-wineprefix.sh  # Converts duplicate DLLs to symlinks (saves ~600MB)
+│   └── ...                    # Other helper scripts
 ├── host-debs/                 # Bundled .deb packages (~10MB amd64 + ~94MB i386)
 │   ├── MANIFEST.md            # License + source info for each package
 │   ├── *.deb                  # 42 amd64 packages (openbox, xdotool, ImageMagick, ...)
-│   └── i386/                  # 3 i386 packages (wine32, libwine, libc6) for 32-bit support
-├── prefix/                    # Wine 10 + Mesa llvmpipe + libs (~870MB, generated by setup)
-├── examples/
-│   ├── dx9_triangle.cpp       # Minimal DX9 triangle (smoke test)
-│   ├── dx9_triangle.exe       # Precompiled (PE32+ x86-64)
-│   ├── dx9_cube.cpp           # Rotating textured cube (vertex + index buffer + transforms)
-│   ├── dx9_cube.exe           # Precompiled (PE32+ x86-64)
-│   ├── hello_win.cpp          # Console program that prints system info
-│   ├── hello_win.exe          # Precompiled (PE32+ x86-64)
-│   ├── hello_win_32.exe       # Precompiled (PE32 i386, for 32-bit testing)
-│   └── example_screenshot.png # Reference screenshot of the smoke test
+│   └── i386/                  # 3 i386 packages (wine32, libwine, libc6) for 32-bit
+├── examples/                  # Sample Windows .exe files for testing
+│   ├── dx9_triangle.*         # Minimal DX9 triangle (smoke test)
+│   ├── dx9_cube.*             # Rotating textured cube (vertex + index buffer + transforms)
+│   ├── hello_win.*            # Console program that prints system info (64-bit + 32-bit)
+│   └── example_screenshot.png # Reference screenshot
 ├── docs/
 │   └── GUIDE_LLM.md           # In-depth operational guide for LLM agents
 ├── README.md
 ├── GITHUB.md                  # How to publish releases
-├── LICENSE                    # MIT
-└── .gitignore
+└── LICENSE                    # MIT
 ```
-
----
-
-## CLI Command Reference
-
-All commands return a single JSON object to stdout. Warnings and debug logs go to stderr and `~/.cache/headlesslab/debug.log` (rotating, max 1MB).
-
-| Command | Arguments | Description |
-|---------|-----------|-------------|
-| **`init`** | `[--geometry G]` | Initializes Xvfb + Openbox (auto-sets `XDG_DATA_DIRS`), keyboard `us`. Respects `--geometry`. |
-| **`exec`** | `<exe_path> [--display D] [args...]` | Executes EXE via Wine/bwrap. Accepts Unix paths (`/home/z/app.exe`) or Windows paths (`C:\windows\system32\notepad.exe`). Validates Wine survived startup. Returns `arch: i386\|x86_64`. |
-| **`screenshot`** | `[--session S] [--out P]` | Captures root window PNG. Tries ImageMagick `import` first, falls back to python-xlib. |
-| **`wait-window`** | `<session_id> [--timeout MS]` | Polls window and waits for pixel stability (150ms identical). |
-| **`click`** | `<x> <y> [--session S] [--display D]` | Simulates mouse click. `--session` required when multiple sessions active. |
-| **`key`** | `<keysym> [--session S] [--display D]` | Presses a keysym (`Return`, `Escape`, `Tab`, ...). |
-| **`type`** | `"<text>" [--session S] [--display D]` | Simulates ASCII typing with `--clearmodifiers`. |
-| **`clipboard`** | `[--write T] [--session S] [--display D]` | Reads or writes X11 clipboard with retries. |
-| **`windows`** | `[--session S] [--display D]` | Lists open windows grouped by session, flags modals. |
-| **`focus`** | `<session_id>` | Focuses the session's window. |
-| **`accept-dialog`** | `<session_id> [--clicks N] [--delay S]` | Auto-accept modal dialogs (EULA, OK/Cancel) by pressing Enter. |
-| **`logs`** | `<session_id> [--lines N]` | Returns Wine + EXE stdout/stderr (auto-decodes UTF-16). |
-| **`kill`** | `<session_id>` | Kills session by WINEPREFIX (robust vs reparented wineserver). Returns `killed_pids`. |
-| **`list`** | *(none)* | Lists all sessions (alive=`running`, dead=`dead` for post-mortem logs). |
-| **`--verify`** | *(none)* | Integrated smoke test: init → exec dx9_triangle → wait-window → screenshot → analyze. Exit 0 on pass, 1 on fail. |
-
----
-
-## Host Prerequisites
-
-HeadlessLab bundles all heavy graphics and compatibility libraries (Wine, Mesa, LLVM, bwrap). The only host dependencies are native X11 display and input tools.
-
-### Option A — Bundled .deb packages (no sudo)
-
-The `host-debs/` directory ships 42 pre-downloaded `.deb` packages (~10MB amd64 + ~94MB i386). Install them with:
-
-```bash
-bash bin/install-host-deps.sh
-source ~/.local/share/headlesslab/env.sh
-```
-
-This extracts everything to `~/.local/` and writes an env file that you can `source` to make the tools discoverable. Idempotent and safe to re-run.
-
-> **Xvfb** is the ONE host dependency not bundled (it needs kernel DRM/KMS access). Install it with `sudo apt-get install -y xvfb`.
-
-### Option B — System-wide install (with sudo)
-
-```bash
-sudo apt update && sudo apt install -y xvfb openbox xdotool wmctrl x11-utils xclip imagemagick \
-    libx11-6 libvulkan1
-python3 -m pip install --user --break-system-packages python-xlib Pillow
-```
-
-### Verify host requirements
-
-```bash
-./bin/setup.sh --check
-```
-
----
-
-## 32-bit (i386) Windows Binary Support
-
-HeadlessLab supports both 64-bit (PE32+ x86-64) and 32-bit (PE32 i386) Windows binaries via Wine's WoW64 mode. The 32-bit support is **opt-in**:
-
-```bash
-bash bin/setup-32bit.sh
-```
-
-This downloads `wine32:i386`, `libwine:i386`, and `libc6:i386` from the Debian pool (no sudo, no `dpkg --add-architecture`), patches the 32-bit wine binary's ELF interpreter to run inside the bwrap sandbox, and populates `syswow64/` with i386 DLLs. After running, the `headless` CLI automatically detects PE architecture and reports it in the JSON response:
-
-```bash
-./bin/headless exec examples/hello_win_32.exe
-# {"status": "ok", "session_id": "sess_...", "pid": 12345, "arch": "i386"}
-
-./bin/headless exec examples/hello_win.exe
-# {"status": "ok", "session_id": "sess_...", "pid": 12346, "arch": "x86_64"}
-```
-
----
-
-## AppImage (Standalone Release)
-
-To package HeadlessLab as a self-contained AppImage (~253MB):
-
-```bash
-bash bin/pack-appimage.sh
-# Creates ./HeadlessLab.AppImage
-```
-
-### Running AppImage without FUSE (containers / LLM sandboxes)
-
-In environments where FUSE is unavailable, pre-extract the AppImage once and run from the extracted directory:
-
-```bash
-./HeadlessLab.AppImage --appimage-extract
-cd squashfs-root
-export APPDIR="$PWD"
-./AppRun --verify
-./AppRun init
-./AppRun exec /path/to/app.exe
-```
-
-See `GITHUB.md` for release publishing instructions.
 
 ---
 
@@ -270,6 +250,7 @@ See `GITHUB.md` for release publishing instructions.
 3. **No DX10/DX11/DX12**: Limited to DX9. Higher versions require DXVK and a physical Vulkan-capable GPU.
 4. **Xvfb requires sudo**: Xvfb is the one host dependency that cannot be bundled (needs kernel DRM access).
 5. **EXE write paths**: Windows apps can only write to paths inside the Wine prefix (`C:\users\...`). Writing to `Z:\home\...` is not supported by the bwrap sandbox.
+6. **AppImage size**: The AppImage is ~253MB (contains Wine 10 + Mesa + LLVM). This is the tradeoff for zero compilation.
 
 ---
 
@@ -277,6 +258,7 @@ See `GITHUB.md` for release publishing instructions.
 
 - **[`docs/GUIDE_LLM.md`](docs/GUIDE_LLM.md)** — In-depth operational guide for LLM agents (architecture, debugging, common problems)
 - **[`GITHUB.md`](GITHUB.md)** — How to publish releases and AppImages to GitHub
+- **`headless --help`** — Full CLI reference with examples
 - **[`host-debs/MANIFEST.md`](host-debs/MANIFEST.md)** — License and source info for bundled .deb packages
 
 ---

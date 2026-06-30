@@ -1190,88 +1190,196 @@ def run_verify(args):
 
 # --- Main CLI Entrypoint ---
 
+HEADLESS_EPILOG = """\
+────────────────────────────────────────────────────────────────────────────────
+COMMON WORKFLOWS FOR LLM AGENTS:
+
+  1. First run / smoke test (verify everything is set up):
+     headless --verify
+
+  2. Run a Windows .exe and capture a screenshot (the 80% case):
+     headless init                                    # start virtual display
+     headless exec /path/to/app.exe                   # returns {"session_id":"sess_...","arch":"x86_64"}
+     headless wait-window sess_...                    # wait for window to appear and stabilize
+     headless screenshot --session sess_... --out /tmp/capture.png
+     headless kill sess_...                           # clean up
+
+  3. Interact with the running app (click, type, key):
+     headless click 400 300 --session sess_...        # left-click at (400,300)
+     headless type "Hello World" --session sess_...   # type ASCII text
+     headless key Return --session sess_...           # press Enter
+     headless key Escape --session sess_...           # press Esc
+
+  4. Accept EULA / OK dialogs that block the app:
+     headless accept-dialog sess_...                  # press Enter on default button
+     headless accept-dialog sess_... --clicks 3       # for multi-step wizards
+
+  5. Inspect what's happening:
+     headless list                                    # all sessions (running or dead)
+     headless windows --session sess_...              # list windows + detect modals
+     headless logs sess_... --lines 50                # Wine + EXE stdout/stderr (auto UTF-16 decode)
+
+  6. Use the clipboard (for non-ASCII text input via Ctrl+V):
+     headless clipboard --write "Tëxt wíth ünïcödé" --session sess_...
+     headless key ctrl+v --session sess_...           # paste into app
+
+NOTES:
+  • ALL commands return a single JSON object to stdout. Parse it with json.loads().
+  • Warnings and debug logs go to stderr (not stdout) — safe to parse stdout directly.
+  • exe_path accepts both Unix paths (/home/z/app.exe) and Windows paths (C:\\\\windows\\\\system32\\\\notepad.exe).
+  • The exec response includes "arch":"i386" or "arch":"x86_64" — use it to know which mode ran.
+  • When multiple sessions are active, input commands (click/key/type/clipboard) require --session.
+  • Session cache lives at ~/.cache/headlesslab/ (registry.json, debug.log, per-session dirs).
+  • If headless --verify fails, the host is missing prerequisites — run ./bin/setup.sh --check.
+────────────────────────────────────────────────────────────────────────────────"""
+
 def main():
-    parser = argparse.ArgumentParser(description="Headless Wine DX9 CLI Controller")
-    
+    parser = argparse.ArgumentParser(
+        prog="headless",
+        description=(
+            "HeadlessLab — run Windows GUI apps headless on Linux (no sudo, no Docker, no GPU).\n"
+            "Each command returns a single JSON object to stdout for easy parsing by LLM agents."
+        ),
+        epilog=HEADLESS_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
     # Global flags
-    parser.add_argument("--verify", action="store_true", help="Runs the integrated smoke test")
-    
-    subparsers = parser.add_subparsers(dest="command")
+    parser.add_argument("--verify", action="store_true",
+        help="Run the integrated smoke test (init → exec example → screenshot → analyze). Exit 0 on pass, 1 on fail.")
+
+    subparsers = parser.add_subparsers(dest="command", metavar="command")
 
     # Command: init
-    parser_init = subparsers.add_parser("init", help="Initializes virtual Xvfb server + Window Manager")
-    parser_init.add_argument("--geometry", default="1920x1080x24", help="Virtual display resolution")
+    parser_init = subparsers.add_parser("init",
+        help="Start Xvfb + Openbox (must run before exec)",
+        description="Start the virtual Xvfb display and Openbox window manager. Must be run once before 'exec'. Returns the display number and geometry.",
+        epilog='Example:\n  headless init\n  → {"status":"ok","display":":99","geometry":"1920x1080x24"}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_init.add_argument("--geometry", default="1920x1080x24",
+        help="Virtual display resolution (default: 1920x1080x24)")
 
     # Command: exec
-    parser_exec = subparsers.add_parser("exec", help="Executes a Windows application (.exe)")
-    parser_exec.add_argument("exe_path", help="Path to the Windows executable")
-    parser_exec.add_argument("--display", help="Specify X11 display to use (e.g. :99)")
-    parser_exec.add_argument("args", nargs=argparse.REMAINDER, help="Extra arguments for the application")
+    parser_exec = subparsers.add_parser("exec",
+        help="Execute a Windows .exe (returns session_id)",
+        description="Execute a Windows application (.exe) via Wine inside a bwrap sandbox. Returns a JSON object with session_id, pid, and arch (i386 or x86_64). Accepts both Unix paths (/home/z/app.exe) and Windows paths (C:\\\\windows\\\\system32\\\\notepad.exe).",
+        epilog='Examples:\n  headless exec /path/to/app.exe\n  headless exec C:\\\\windows\\\\system32\\\\notepad.exe\n  → {"status":"ok","session_id":"sess_123","pid":987,"arch":"x86_64"}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_exec.add_argument("exe_path", help="Path to the Windows .exe (Unix path or Windows C:\\\\... path)")
+    parser_exec.add_argument("--display", help="X11 display to use (default: auto-detected from active sessions)")
+    parser_exec.add_argument("args", nargs=argparse.REMAINDER, help="Extra arguments to pass to the .exe")
 
     # Command: screenshot
-    parser_screenshot = subparsers.add_parser("screenshot", help="Takes a screenshot of the virtual display")
-    parser_screenshot.add_argument("--session", help="Specific session to get coordinates from")
-    parser_screenshot.add_argument("--out", help="Output PNG file path")
+    parser_screenshot = subparsers.add_parser("screenshot",
+        help="Capture a PNG screenshot of the virtual display",
+        description="Capture the root window (or a specific session's window) as a PNG. Tries ImageMagick 'import' first, falls back to python-xlib.",
+        epilog='Examples:\n  headless screenshot --session sess_... --out /tmp/capture.png\n  headless screenshot --out /tmp/screen.png  (uses first active session)',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_screenshot.add_argument("--session", help="Session ID to capture (default: first active session)")
+    parser_screenshot.add_argument("--out", help="Output PNG path (default: /tmp/screenshot_<timestamp>.png)")
+
+    # Command: wait-window
+    parser_wait = subparsers.add_parser("wait-window",
+        help="Wait for window to appear and pixels to stabilize",
+        description="Poll the session's window and wait until pixel output is stable for 150ms. Essential before taking screenshots — ensures the app has finished rendering.",
+        epilog='Examples:\n  headless wait-window sess_...\n  headless wait-window sess_... --timeout 20000\n  → {"status":"ok","elapsed_ms":480}  (or {"status":"timeout"} with exit code 2)',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_wait.add_argument("session_id", help="Session ID")
+    parser_wait.add_argument("--timeout", type=int, default=10000, help="Timeout in ms (default: 10000)")
 
     # Command: click
-    parser_click = subparsers.add_parser("click", help="Simulates mouse click")
-    parser_click.add_argument("x", type=int, help="X coordinate")
-    parser_click.add_argument("y", type=int, help="Y coordinate")
-    parser_click.add_argument("--session", help="Session ID (required if multiple sessions are active)")
-    parser_click.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+    parser_click = subparsers.add_parser("click",
+        help="Simulate a mouse left-click at (x, y)",
+        description="Simulate a mouse left-click at the given coordinates. Coordinates are relative to the virtual display (0,0 = top-left, 1919,1079 = bottom-right for 1920x1080).",
+        epilog='Example:\n  headless click 400 300 --session sess_...\n  → {"status":"ok"}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_click.add_argument("x", type=int, help="X coordinate (0-1919 for 1920x1080)")
+    parser_click.add_argument("y", type=int, help="Y coordinate (0-1079 for 1920x1080)")
+    parser_click.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_click.add_argument("--display", help="X11 display (alternative to --session)")
 
     # Command: key
-    parser_key = subparsers.add_parser("key", help="Simulates key press (KeySym)")
-    parser_key.add_argument("keysym", help="Key code (e.g. Return, Escape, Tab)")
-    parser_key.add_argument("--session", help="Session ID (required if multiple sessions are active)")
-    parser_key.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+    parser_key = subparsers.add_parser("key",
+        help="Press a key (KeySym name)",
+        description="Press a single key using its X11 KeySym name. Common keys: Return, Escape, Tab, space, BackSpace, ctrl+c, ctrl+v, F1-F12, Up, Down, Left, Right.",
+        epilog='Examples:\n  headless key Return --session sess_...\n  headless key ctrl+v --session sess_...  (paste from clipboard)',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_key.add_argument("keysym", help="KeySym name (e.g. Return, Escape, Tab, ctrl+v, ctrl+c)")
+    parser_key.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_key.add_argument("--display", help="X11 display (alternative to --session)")
 
     # Command: type
-    parser_type = subparsers.add_parser("type", help="Simulates ASCII text typing")
-    parser_type.add_argument("text", help="ASCII text to type")
-    parser_type.add_argument("--session", help="Session ID (required if multiple sessions are active)")
-    parser_type.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
-
-    # Command: logs
-    parser_logs = subparsers.add_parser("logs", help="Returns session logs")
-    parser_logs.add_argument("session_id", help="Session ID")
-    parser_logs.add_argument("--lines", type=int, help="Number of lines from the tail")
-
-    # Command: kill
-    parser_kill = subparsers.add_parser("kill", help="Terminates session processes and frees resources")
-    parser_kill.add_argument("session_id", help="Session ID")
-
-    # Command: list
-    subparsers.add_parser("list", help="Lists all active sessions")
+    parser_type = subparsers.add_parser("type",
+        help="Type ASCII text (for Unicode, use clipboard + Ctrl+V)",
+        description="Simulate typing ASCII text character by character. For non-ASCII (Unicode) text, use 'clipboard --write' followed by 'key ctrl+v' instead.",
+        epilog='Example:\n  headless type "Hello World" --session sess_...',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_type.add_argument("text", help="ASCII text to type (non-ASCII will be rejected)")
+    parser_type.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_type.add_argument("--display", help="X11 display (alternative to --session)")
 
     # Command: clipboard
-    parser_clip = subparsers.add_parser("clipboard", help="Reads or writes to the X11 clipboard")
-    parser_clip.add_argument("--write", help="Write text to the clipboard")
-    parser_clip.add_argument("--session", help="Session ID (required if multiple sessions are active)")
-    parser_clip.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+    parser_clip = subparsers.add_parser("clipboard",
+        help="Read or write the X11 clipboard (for Unicode text input)",
+        description="Read from or write to the X11 clipboard. Use '--write TEXT' to set the clipboard, then 'key ctrl+v' to paste into the app. Supports full Unicode (unlike 'type' which is ASCII-only).",
+        epilog='Examples:\n  headless clipboard --write "Tëxt wíth ünïcödé" --session sess_...\n  headless clipboard --session sess_...  (read current clipboard)',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_clip.add_argument("--write", help="Write this text to the clipboard (omit to read instead)")
+    parser_clip.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_clip.add_argument("--display", help="X11 display (alternative to --session)")
 
     # Command: windows
-    parser_windows = subparsers.add_parser("windows", help="Lists all mapped active windows")
+    parser_windows = subparsers.add_parser("windows",
+        help="List all open windows (detects modals)",
+        description="List all mapped windows on the virtual display, grouped by session. Each window entry includes id, pid, session_id, title, and type ('normal' or 'modal'). Use this to find window titles or detect blocking dialogs.",
+        epilog='Example:\n  headless windows --session sess_...\n  → {"status":"ok","windows":[{"id":"0x00c00001","pid":1234,"session_id":"sess_...","title":"My App","type":"normal"}]}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser_windows.add_argument("--session", help="Filter windows by session ID")
-    parser_windows.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+    parser_windows.add_argument("--display", help="X11 display (alternative to --session)")
 
     # Command: focus
-    parser_focus = subparsers.add_parser("focus", help="Focuses on the session's window")
+    parser_focus = subparsers.add_parser("focus",
+        help="Focus a session's window",
+        description="Activate (focus) the main window of a session. Useful before sending input to ensure the right window receives it.",
+        epilog='Example:\n  headless focus sess_...',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser_focus.add_argument("session_id", help="Session ID")
 
-    # Command: accept-dialog (NEW — auto-accept EULA/OK dialogs by pressing Enter)
+    # Command: accept-dialog
     parser_accept = subparsers.add_parser("accept-dialog",
-        help="Auto-accept a modal dialog (EULA, OK/Cancel) by pressing Enter on the default button")
+        help="Auto-accept a modal dialog (EULA, OK/Cancel) by pressing Enter",
+        description="Focus the most recent window (usually a modal dialog) and press Enter to activate the default button (OK, Accept, Yes, etc.). For multi-step wizards, use --clicks N.",
+        epilog='Examples:\n  headless accept-dialog sess_...                  (press Enter once)\n  headless accept-dialog sess_... --clicks 3       (for 3-step wizard)\n  → {"status":"ok","pressed_enter_count":1,"window_id":"0x...","window_title":"License Agreement"}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser_accept.add_argument("session_id", help="Session ID")
     parser_accept.add_argument("--clicks", type=int, default=1,
-        help="Number of times to press Enter (default 1). Use >1 for multi-step wizards.")
+        help="Number of Enter presses (default 1). Use >1 for multi-step wizards.")
     parser_accept.add_argument("--delay", type=float, default=0.3,
         help="Delay between Enter presses in seconds (default 0.3)")
 
-    # Command: wait-window
-    parser_wait = subparsers.add_parser("wait-window", help="Waits for window and pixel stability")
-    parser_wait.add_argument("session_id", help="Session ID")
-    parser_wait.add_argument("--timeout", type=int, help="Timeout in ms")
+    # Command: logs
+    parser_logs = subparsers.add_parser("logs",
+        help="Get Wine + EXE stdout/stderr logs (auto UTF-16 decode)",
+        description="Return the log output (stdout + stderr) of a session. Includes Wine debug messages AND the EXE's own printf output. Auto-decodes UTF-16 output (common for Windows console apps like sigcheck, ipconfig).",
+        epilog='Examples:\n  headless logs sess_...                           (full log)\n  headless logs sess_... --lines 50                (last 50 lines)\n  → {"status":"ok","logs":"=== DX9 Test Program ===\\n[OK] Window created..."}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_logs.add_argument("session_id", help="Session ID")
+    parser_logs.add_argument("--lines", type=int, help="Number of lines from the tail (default: all)")
+
+    # Command: kill
+    parser_kill = subparsers.add_parser("kill",
+        help="Kill a session and free resources",
+        description="Kill all Wine processes belonging to a session (by WINEPREFIX), then delete the session cache directory. Returns the list of killed PIDs.",
+        epilog='Example:\n  headless kill sess_...\n  → {"status":"ok","killed_pids":[1234,1235,1236,...]}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_kill.add_argument("session_id", help="Session ID")
+
+    # Command: list
+    parser_list = subparsers.add_parser("list",
+        help="List all sessions (running and dead)",
+        description="List all registered sessions. Dead sessions (where the PID no longer exists) are preserved with state='dead' so you can still inspect their logs via 'logs <session_id>'.",
+        epilog='Example:\n  headless list\n  → {"status":"ok","sessions":[{"session_id":"sess_...","pid":1234,"state":"running",...}]}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
 
     args = parser.parse_args()
 
