@@ -1,42 +1,94 @@
-# Ultimate Guide: Running Windows DirectX 9 Applications Headless Without Sudo
+# HeadlessLab — Operational Guide for LLM Agents
 
-> **For readers**: This is an operational guide for an LLM agent to execute Windows programs (specifically DirectX 9) in headless mode inside a Linux sandbox **without sudo**, **without Docker**, and **without physical GPU**.
+> **For LLM agents**: This guide teaches you how to run Windows applications (DirectX 9, console, GUI) headless on Linux using the `headless` CLI. You will learn how to install the runtime, execute Windows `.exe` files, capture screenshots, simulate input, and debug common problems — all **without sudo**, **without Docker**, and **without a physical GPU**.
 >
-> The guide has been empirically validated on Debian 13 (trixie) and should work on any recent Debian/Ubuntu system with kernel ≥ 5.10.
+> Validated on Debian 13 (trixie). Should work on any recent Debian/Ubuntu system with kernel ≥ 5.10.
 
 ---
 
 ## 📋 Executive Summary
 
-You will build an environment that:
-1. Downloads `.deb` packages locally via `apt-get download` (no sudo needed)
-2. Extracts them with `dpkg-deb -x` into a local prefix
-3. Uses **Bubblewrap** to map paths without root privileges
-4. Runs **Wine 10.0** inside the sandbox
-5. Renders to **Xvfb** (virtual headless display)
-6. Uses **Mesa llvmpipe** (software Vulkan/OpenGL) as the virtual GPU
-7. Captures screenshots via **Python Xlib**
+HeadlessLab provides a single CLI tool (`headless`) that:
 
-Result: A DirectX 9 `.exe` runs, renders a colored triangle to the virtual screen, and you can capture a screenshot of it.
+1. Starts a **virtual X11 display** (Xvfb + Openbox) — no monitor needed
+2. Executes **Windows `.exe` files** via **Wine 10.0** inside a **Bubblewrap** sandbox (no root)
+3. Renders **DirectX 9** graphics via **Mesa llvmpipe** (software rasterizer, CPU-only — no GPU)
+4. Captures **screenshots** and simulates **mouse/keyboard input**
+5. Returns **JSON output** for every command — trivially parseable by LLM agents
+
+Supports both **64-bit** (PE32+ x86-64) and **32-bit** (PE32 i386) Windows binaries via Wine's WoW64 mode.
 
 ---
 
-## 🔍 Pre-flight Check: Verify the Sandbox Before Starting
+## 🚀 Getting Started
 
-Before doing anything, run this block and **paste the output into your response**. This tells you exactly what is already available and what needs to be downloaded.
+### Option A — AppImage (recommended, no compilation)
+
+Download the pre-built AppImage (~454MB, includes Wine 10 + Mesa + 32-bit support + the `headless` CLI):
+
+```bash
+# 1. Clone the repo and install host tools (one-time, ~10MB)
+git clone https://github.com/Vmarcelo49/HeadlessLab.git
+cd HeadlessLab
+bash bin/install-host-deps.sh
+source ~/.local/share/headlesslab/env.sh
+
+# 2. Install Xvfb (requires sudo — it's the only host dep that needs kernel access)
+sudo apt-get install -y xvfb
+
+# 3. Download the AppImage
+curl -sSL -o HeadlessLab.AppImage \
+  https://github.com/Vmarcelo49/HeadlessLab/releases/latest/download/HeadlessLab.AppImage
+chmod +x HeadlessLab.AppImage
+
+# 4. Verify everything works
+./HeadlessLab.AppImage --verify
+```
+
+**Environments without FUSE** (Docker, LLM sandboxes, CI):
+
+```bash
+# Pre-extract once (~870MB on disk)
+./HeadlessLab.AppImage --appimage-extract
+cd squashfs-root
+export APPDIR="$PWD"
+
+# Use ./AppRun instead of ./HeadlessLab.AppImage
+./AppRun --verify
+./AppRun init
+./AppRun exec /path/to/app.exe
+```
+
+### Option B — Build from source
+
+```bash
+git clone https://github.com/Vmarcelo49/HeadlessLab.git
+cd HeadlessLab
+bash bin/install-host-deps.sh
+source ~/.local/share/headlesslab/env.sh
+sudo apt-get install -y xvfb  # only host dep requiring sudo
+bash bin/build-from-scratch.sh
+bash bin/setup-32bit.sh  # optional: adds 32-bit support
+./bin/headless --verify
+```
+
+---
+
+## 🔍 Pre-flight Check
+
+Before starting, run this diagnostic block to see what's available on the host:
 
 ```bash
 echo "=== OS info ==="
 uname -a
-cat /etc/os-release 2>/dev/null | head -5
+cat /etc/os-release 2>/dev/null | head -3
 
 echo "=== User ==="
 whoami
-id
 sudo -n true 2>&1 | head -1
 
-echo "=== Basic Tools ==="
-for cmd in apt-get dpkg-deb curl wget bash python3 Xvfb bwrap gcc g++; do
+echo "=== Required tools ==="
+for cmd in bash python3 Xvfb openbox xdotool wmctrl xprop xclip; do
     if which $cmd > /dev/null 2>&1; then
         echo "  OK  $cmd -> $(which $cmd)"
     else
@@ -44,72 +96,65 @@ for cmd in apt-get dpkg-deb curl wget bash python3 Xvfb bwrap gcc g++; do
     fi
 done
 
-echo "=== Host Libraries (LLVM, X11, Vulkan) ==="
-for lib in libLLVM-19.so libX11.so.6 libvulkan.so.1; do
-    if ls /usr/lib/x86_64-linux-gnu/$lib* > /dev/null 2>&1; then
-        echo "  OK  $lib"
-    else
-        echo "  MISSING $lib"
-    fi
-done
-
-echo "=== Python packages ==="
+echo "=== Screenshot tools ==="
+which import 2>/dev/null && echo "  OK  ImageMagick import" || echo "  MISSING import (will fall back to python-xlib)"
 python3 -c "import Xlib; print('  OK  python-xlib')" 2>/dev/null || echo "  MISSING python-xlib"
 python3 -c "from PIL import Image; print('  OK  Pillow')" 2>/dev/null || echo "  MISSING Pillow"
+
+echo "=== Host libraries ==="
+for lib in libX11.so.6 libvulkan.so.1; do
+    ls /usr/lib/x86_64-linux-gnu/$lib* > /dev/null 2>&1 && echo "  OK  $lib" || echo "  MISSING $lib"
+done
 
 echo "=== Disk space ==="
 df -h /home/z 2>/dev/null | head -2
 ```
 
-### Interpreting the Results
-
-- **If `bwrap` is MISSING**: You need to download `bubblewrap` via `apt-get download`. Proceed to Step 1.
-- **If `Xvfb` is MISSING**: Download `xvfb`. Proceed to Step 1.
-- **If `libLLVM-19.so` is MISSING**: Download `libllvm19` and its dependencies. **Or** use the GitHub bundle which already includes LLVM (see "Plan B" section).
-- **If `python-xlib` or `Pillow` is MISSING**: Install via `pip install --user --break-system-packages python-xlib Pillow`.
-- **If `apt-get` is MISSING**: You are on a non-Debian system. Use the precompiled GitHub bundle (Plan B).
+**Interpreting results:**
+- If `Xvfb` is MISSING: install with `sudo apt-get install -y xvfb` (requires sudo)
+- If `openbox`/`xdotool`/`wmctrl`/`xprop`/`xclip` are MISSING: run `bash bin/install-host-deps.sh` (no sudo)
+- If `import` is MISSING: `headless screenshot` will fall back to python-xlib automatically
+- If `python-xlib` or `Pillow` is MISSING: install via `pip install --user python-xlib Pillow`
 
 ---
 
-## 📐 Architecture (Understand Before Executing)
+## 📐 Architecture
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ Linux Sandbox (regular user, no sudo, /home/z/my-project/)         │
+│ Linux user space (no sudo, no Docker)                              │
 │                                                                    │
-│  Program.exe (PE32+ x86-64)  ←─── you want to run this             │
+│  app.exe (PE32/PE32+)  ←─── you want to run this                  │
 │       │                                                            │
 │       ▼                                                            │
 │  ┌──────────────────────────────────────────────────────────┐     │
-│  │ Wine 10.0 (wine64)                                       │     │
-│  │   • Loads PE .dlls from system32/                        │     │
-│  │   • Loads unix-side .so files from x86_64-unix/          │     │
+│  │ Wine 10.0 (wine64 / wine via WoW64)                      │     │
+│  │   • Loads PE .dlls from system32/ (64-bit) or syswow64/  │     │
 │  │   • d3d9.dll → wined3d.dll → OpenGL                      │     │
 │  │   • winex11.drv → X11 protocol                          │     │
 │  └──────────────────────────────────────────────────────────┘     │
-│       │ (wrap with Bubblewrap for path remapping)                 │
+│       │ (Bubblewrap sandbox for path remapping)                    │
 │       ▼                                                            │
 │  ┌──────────────────────────────────────────────────────────┐     │
-│  │ Bubblewrap container                                     │     │
+│  │ Bubblewrap container (user namespaces, no root)          │     │
 │  │   • --bind rootfs/usr /usr  (symlinks to host)           │     │
 │  │   • --ro-bind prefix/...wine /usr/lib/wine               │     │
 │  │   • --proc /proc  (CRITICAL: wine needs /proc/self)      │     │
-│  │   • --bind /tmp /tmp  (X11 socket)                       │     │
 │  └──────────────────────────────────────────────────────────┘     │
 │       │                                                            │
 │       ▼                                                            │
 │  ┌──────────────────────────────────────────────────────────┐     │
-│  │ Xvfb :99  (virtual display 1024x768x24, -ac no auth)     │     │
+│  │ Xvfb :99  (virtual display 1920x1080x24, -ac no auth)    │     │
 │  └──────────────────────────────────────────────────────────┘     │
 │       │                                                            │
 │       ▼                                                            │
 │  ┌──────────────────────────────────────────────────────────┐     │
-│  │ Mesa llvmpipe (software rasterizer)                      │     │
+│  │ Mesa llvmpipe (software rasterizer, CPU-only)            │     │
 │  │   • OpenGL via libGL + LLVM JIT                          │     │
-│  │   • Vulkan via libvulkan_lvp.so (ICD = lvp_icd.json)     │     │
+│  │   • Vulkan via libvulkan_lvp.so                          │     │
 │  └──────────────────────────────────────────────────────────┘     │
 │                                                                    │
-│  Screenshot: Python + Xlib reads pixels from Xvfb root window      │
+│  Screenshot: 'import' (ImageMagick) or python-xlib + Pillow        │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -125,455 +170,180 @@ df -h /home/z 2>/dev/null | head -2
 - LLVMpipe is pure software rendering (CPU-bound) and works in any headless sandbox.
 - Performance is low (~5-10 fps), but **sufficient for screenshots and functional validation**.
 
----
+### How 32-bit WoW64 Works (Without sudo)
 
-## 🚀 Execution — Two Options
+Debian's `wine64` package alone does NOT populate `syswow64/` (the 32-bit DLL directory). The traditional approach requires `dpkg --add-architecture i386` (root). HeadlessLab works around this by:
 
-You have two options. **Start with Option A (Plan B: GitHub bundle)** if you just want to run an application and the bundle already exists. Use **Option B (build from scratch)** if the bundle is not available or if you want to understand/debug the system.
+1. Downloading `wine32:i386`, `libwine:i386`, and `libc6:i386` directly from the Debian pool (no `dpkg --add-architecture` needed)
+2. Patching the 32-bit `wine` binary's ELF interpreter to `/usr/lib/ld-linux.so.2` (using `patchelf`) so it can run inside the bwrap sandbox without needing `/lib/ld-linux.so.2` on the host
+3. Manually populating `syswow64/` with symlinks to the `i386-windows/` DLLs after `wineboot`
+4. Adding `--ro-bind` entries for `ld-linux.so.2` and `i386-linux-gnu/` in the bwrap command
 
-### OPTION A — Plan B: Download Precompiled GitHub Bundle
-
-> **Use this option if the GitHub repository already exists and you only need to run a `.exe`.**
-
-```bash
-# 1. Download the bundle (replace USER/REPO with the actual repo)
-mkdir -p /home/z/my-project/headlesslab
-cd /home/z/my-project/headlesslab
-
-BUNDLE_URL="https://github.com/Vmarcelo49/HeadlessLab/releases/latest/download/HeadlessLab.AppImage"
-curl -sSL "$BUNDLE_URL" -o bundle.tar.gz
-tar xzf bundle.tar.gz
-rm bundle.tar.gz
-
-# 2. Expected structure inside the bundle:
-#    headlesslab/
-#    ├── bin/run.sh          (main entrypoint)
-#    ├── bin/screenshot.py   (screen capture)
-#    ├── prefix/             (wine + libs + mesa, ~190MB)
-#    ├── rootfs/             (symlinks to host)
-#    └── wineprefix-template/ (clean copy of WINEPREFIX)
-
-# 3. Run an EXE
-./bin/run.sh /path/to/your.exe
-
-# 4. Screenshot (in another terminal while the EXE is running)
-DISPLAY=:99 python3 bin/screenshot.py :99 /home/z/my-project/download/out.png
-```
-
-**Pros:**
-- Complete setup takes ~30 seconds.
-- Does not depend on `apt-get download` working.
-- Size: ~80MB compressed.
-
-**Cons:**
-- Requires internet access to download.
-- Will fail if the host lacks `libLLVM-19`, `libX11.so.6`, or `libvulkan.so.1` (requires installing via apt or using Option B).
+The `headless` CLI auto-detects the PE architecture (by reading the COFF `Machine` field) and reports it as `"arch": "i386"` or `"arch": "x86_64"` in the `exec` JSON response.
 
 ---
 
-### OPTION B — Build From Scratch (Fallback / Debugging)
+## 🎯 CLI Reference for LLM Agents
 
-> **Use this option if GitHub is inaccessible, or if you need to debug a prefix issue.**
+Run `headless --help` for the full reference. Here are the key workflows:
 
-Follow the **10 steps** below. Each step is a self-contained script block.
-
-#### Step 1: Define Environment Variables
+### Workflow 1: Run a Windows .exe and capture a screenshot (the 80% case)
 
 ```bash
-export SANDBOX_DIR="/home/z/my-project/sandbox"
-export PREFIX="$SANDBOX_DIR/prefix"
-export DOWNLOAD="$SANDBOX_DIR/download"
-export ROOTFS="$SANDBOX_DIR/rootfs"
-export WINEPREFIX="$SANDBOX_DIR/wineprefix"
-export ZLIB_BUILD="$SANDBOX_DIR/zlib-build"
-export DISPLAY=":99"
+# 1. Start the virtual display
+headless init
+# → {"status": "ok", "display": ":99", "geometry": "1920x1080x24"}
 
-mkdir -p "$SANDBOX_DIR" "$PREFIX" "$DOWNLOAD" "$ROOTFS" "$ZLIB_BUILD" "$WINEPREFIX"
-cd "$SANDBOX_DIR"
+# 2. Execute the .exe (returns session_id)
+headless exec /path/to/app.exe
+# → {"status": "ok", "session_id": "sess_123", "pid": 987, "arch": "x86_64"}
+
+# 3. Wait for the window to appear and pixels to stabilize
+headless wait-window sess_123
+# → {"status": "ok", "elapsed_ms": 480}
+
+# 4. Capture a screenshot
+headless screenshot --session sess_123 --out /tmp/capture.png
+# → {"status": "ok", "path": "/tmp/capture.png"}
+
+# 5. Clean up
+headless kill sess_123
+# → {"status": "ok", "killed_pids": [987, 988, 989, ...]}
 ```
 
-#### Step 2: Download All `.deb` Packages (No Sudo)
+### Workflow 2: Interact with the running app
 
 ```bash
-cd "$DOWNLOAD"
+# Mouse click at (400, 300)
+headless click 400 300 --session sess_123
+# → {"status": "ok"}
 
-# List of required packages
-PACKAGES=(
-    # Wine core
-    wine wine64 libwine fonts-wine
-    # MinGW cross-compiler (only needed to compile the test .exe)
-    binutils-mingw-w64-x86-64
-    gcc-mingw-w64-x86-64-win32
-    g++-mingw-w64-x86-64-win32
-    gcc-mingw-w64-x86-64-win32-runtime
-    gcc-mingw-w64-base
-    mingw-w64-x86-64-dev mingw-w64-common
-    # Bubblewrap (isolation without sudo)
-    bubblewrap
-    # Mesa Vulkan with llvmpipe (software rasterizer)
-    mesa-vulkan-drivers
-    # Mesa deps
-    libllvm19 libdrm-amdgpu1 libdrm2 libdrm-intel1 libdrm-nouveau2 libdrm-radeon1
-    libelf1t64 libexpat1 libwayland-client0 libx11-xcb1 libxcb-dri3-0
-    libxcb-present0 libxcb-randr0 libxcb-sync1 libxcb-xfixes0 libxshmfence1
-    libzstd1
-    # proot and libtalloc2 (fallback)
-    proot libtalloc2
-)
+# Type ASCII text
+headless type "Hello World" --session sess_123
+# → {"status": "ok"}
 
-for pkg in "${PACKAGES[@]}"; do
-    echo "Downloading $pkg..."
-    apt-get download "$pkg" 2>&1 | tail -1
-done
+# Press a key (Return, Escape, Tab, ctrl+v, etc.)
+headless key Return --session sess_123
+# → {"status": "ok"}
 
-ls -1 | wc -l  # Should show ~25 packages
+# For non-ASCII (Unicode) text: use clipboard + Ctrl+V
+headless clipboard --write "Tëxt wíth ünïcödé" --session sess_123
+headless key ctrl+v --session sess_123
 ```
 
-#### Step 3: Extract All `.deb` Packages Into Prefix
+### Workflow 3: Accept blocking dialogs (EULA, license agreements)
+
+Some Windows apps show a modal dialog on first run that blocks execution:
 
 ```bash
-cd "$SANDBOX_DIR"
+# After exec, if wait-window times out, check for modals:
+headless windows --session sess_123
+# → {"status": "ok", "windows": [{"id": "0x...", "title": "License Agreement", "type": "modal"}]}
 
-for deb in "$DOWNLOAD"/*.deb; do
-    # Some debs have ":" in the name (escaped as %3a). Rename them.
-    if [[ "$deb" == *%* ]]; then
-        cp "$deb" "${deb}.renamed"
-        deb="${deb}.renamed"
-    fi
-    dpkg-deb -x "$deb" "$PREFIX" 2>/dev/null
-done
+# Accept the dialog (presses Enter on the default button)
+headless accept-dialog sess_123
+# → {"status": "ok", "pressed_enter_count": 1, "window_title": "License Agreement"}
 
-# Verify extraction
-ls "$PREFIX/usr/lib/wine/wine64" && echo "OK: wine64 extracted"
-ls "$PREFIX/usr/bin/bwrap" && echo "OK: bwrap extracted"
-ls "$PREFIX/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so" && echo "OK: llvmpipe extracted"
+# For multi-step wizards (Next → Next → Finish):
+headless accept-dialog sess_123 --clicks 3
 ```
 
-#### Step 4: Patch Wine Wrappers (Hardcoded Paths)
-
-The `wine` and `wineserver` scripts inside `prefix/usr/lib/wine/` point to `/usr/lib/wine/...` which does not exist. Replace them with custom wrappers:
+### Workflow 4: Debug a failing app
 
 ```bash
-# wineserver wrapper
-cat > "$PREFIX/usr/lib/wine/wineserver" <<EOF
-#!/bin/sh -e
-exec $PREFIX/usr/lib/wine/wineserver64 -p0 "\$@"
-EOF
-chmod +x "$PREFIX/usr/lib/wine/wineserver"
+# List all sessions (dead ones are preserved for log inspection)
+headless list
+# → {"status": "ok", "sessions": [{"session_id": "sess_123", "state": "dead", ...}]}
 
-# wine64 wrapper (preserves the real binary)
-if [ ! -f "$PREFIX/usr/lib/wine/wine64.real" ]; then
-    mv "$PREFIX/usr/lib/wine/wine64" "$PREFIX/usr/lib/wine/wine64.real"
-fi
-cat > "$PREFIX/usr/lib/wine/wine64" <<EOF
-#!/bin/sh -e
-export WINELOADER=$PREFIX/usr/lib/wine/wine64.real
-exec $PREFIX/usr/lib/wine/wine64.real "\$@"
-EOF
-chmod +x "$PREFIX/usr/lib/wine/wine64"
+# Get the logs (includes Wine debug + EXE's own printf output, auto UTF-16 decode)
+headless logs sess_123 --lines 50
+# → {"status": "ok", "logs": "=== DX9 Test Program ===\n[OK] Window created...\n..."}
 
-echo "OK: wrappers patched"
+# Check what windows are open
+headless windows --session sess_123
+
+# If the app crashed immediately after exec, the exec response includes
+# the log tail in the error message:
+# → {"status": "error", "code": "WINE_DIED", "message": "Wine process exited immediately. Log tail: ..."}
 ```
 
-#### Step 5: Create rootfs With Host Symlinks
+### Important Notes for Agents
 
-Bubblewrap needs a rootfs. Since we cannot install system libraries globally, we create a rootfs containing symlinks to host directories, **except** where we override them (Wine directories).
-
-```bash
-mkdir -p "$ROOTFS/usr/lib" "$ROOTFS/usr/lib/x86_64-linux-gnu" \
-         "$ROOTFS/usr/share" "$ROOTFS/usr/bin" "$ROOTFS/usr/sbin"
-
-# Symlinks for /usr/lib/* (skipping wine)
-for item in /usr/lib/*; do
-    name=$(basename "$item")
-    [ "$name" = "wine" ] && continue
-    [ "$name" = "x86_64-linux-gnu" ] && continue
-    ln -sf "/host-usr/lib/$name" "$ROOTFS/usr/lib/$name"
-done
-
-# Symlinks for /usr/lib/x86_64-linux-gnu/* (skipping wine)
-for item in /usr/lib/x86_64-linux-gnu/*; do
-    name=$(basename "$item")
-    [ "$name" = "wine" ] && continue
-    ln -sf "/host-usr/lib/x86_64-linux-gnu/$name" "$ROOTFS/usr/lib/x86_64-linux-gnu/$name"
-done
-
-# Symlinks for /usr/share/* (skipping wine and vulkan)
-for item in /usr/share/*; do
-    name=$(basename "$item")
-    [ "$name" = "wine" ] && continue
-    [ "$name" = "vulkan" ] && continue
-    ln -sf "/host-usr/share/$name" "$ROOTFS/usr/share/$name"
-done
-
-# Symlinks for /usr/bin/* and /usr/sbin/*
-for item in /usr/bin/*; do
-    ln -sf "/host-usr/bin/$(basename "$item")" "$ROOTFS/usr/bin/$(basename "$item")"
-done
-for item in /usr/sbin/*; do
-    ln -sf "/host-usr/sbin/$(basename "$item")" "$ROOTFS/usr/sbin/$(basename "$item")"
-done
-
-# Base directories of rootfs (symlinks to host)
-for d in bin sbin lib lib64 etc; do
-    rm -rf "$ROOTFS/$d"
-    ln -sf "/host-$d" "$ROOTFS/$d"
-done
-
-# Create empty directories to be bind-mounted (bwrap populates them)
-mkdir -p "$ROOTFS/usr/lib/wine" "$ROOTFS/usr/lib/x86_64-linux-gnu/wine" "$ROOTFS/usr/share/wine"
-mkdir -p "$ROOTFS/usr/share/vulkan"
-
-echo "OK: rootfs created at $ROOTFS"
-```
-
-#### Step 6: Compile `zlib1.dll` (Required Since Debian Omits It)
-
-Wine's `user32.dll` imports `zlib1.dll`, but Debian's `libwine` package does not bundle this DLL. We compile it from source:
-
-```bash
-cd "$ZLIB_BUILD"
-
-# Download zlib 1.3.1 (GitHub release)
-if [ ! -f zlib-1.3.1.tar.gz ]; then
-    curl -sSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz -o zlib.tar.gz
-fi
-tar xzf zlib.tar.gz
-cd zlib-1.3.1
-
-# Compile with MinGW
-export PATH="$PREFIX/usr/bin:$PATH"
-for src in adler32.c crc32.c deflate.c inflate.c inftrees.c inffast.c zutil.c \
-           trees.c gzclose.c gzlib.c gzread.c gzwrite.c compress.c uncompr.c; do
-    [ -f "$src" ] && x86_64-w64-mingw32-gcc -O2 -DZLIB_DLL -DWINDOWS -c "$src" -o "${src%.c}.o"
-done
-
-x86_64-w64-mingw32-gcc -shared -o zlib1.dll \
-    -Wl,--out-implib,libz.dll.a \
-    adler32.o crc32.o deflate.o inflate.o inftrees.o inffast.o zutil.o trees.o \
-    gzclose.o gzlib.o gzread.o gzwrite.o compress.o uncompr.o
-
-# Copy to the Wine PE path
-cp zlib1.dll "$PREFIX/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/"
-
-echo "OK: zlib1.dll compiled at $PREFIX/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/zlib1.dll"
-```
-
-#### Step 7: Start Xvfb (Headless Virtual Display)
-
-```bash
-# Kill any stale Xvfb process
-pkill -9 Xvfb 2>/dev/null || true
-sleep 1
-rm -rf /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null
-
-# Start as a persistent daemon (setsid + disown)
-setsid Xvfb :99 -screen 0 1024x768x24 -ac -nolisten tcp </dev/null >/tmp/xvfb.log 2>&1 &
-disown
-sleep 2
-
-# Verify
-if pgrep -f "Xvfb :99" > /dev/null; then
-    echo "OK: Xvfb running (PID: $(pgrep -f 'Xvfb :99'))"
-else
-    echo "FAIL: Xvfb did not start. Log:"
-    cat /tmp/xvfb.log
-fi
-```
-
-**⚠️ IMPORTANT:** The `-ac` flag is mandatory. Without it, Xvfb enforces host access authentication, blocking Wine connections.
-
-#### Step 8: Initialize WINEPREFIX
-
-```bash
-export BWRAP="$PREFIX/usr/bin/bwrap"
-export WINE64="$PREFIX/usr/lib/wine/wine64"
-
-# Helper function to run Wine inside bwrap
-run_wine() {
-    "$BWRAP" \
-        --ro-bind /usr /host-usr \
-        --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
-        --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /etc /etc \
-        --bind /tmp /tmp \
-        --bind /home/z/my-project /home/z/my-project \
-        --bind "$ROOTFS/usr" /usr \
-        --ro-bind "$PREFIX/usr/lib/wine" /usr/lib/wine \
-        --ro-bind "$PREFIX/usr/lib/x86_64-linux-gnu/wine" /usr/lib/x86_64-linux-gnu/wine \
-        --ro-bind "$PREFIX/usr/share/wine" /usr/share/wine \
-        --ro-bind "$PREFIX/usr/share/vulkan" /usr/share/vulkan \
-        --proc /proc \
-        --dev /dev \
-        --setenv DISPLAY :99 \
-        --setenv WINEPREFIX "$WINEPREFIX" \
-        --setenv LD_LIBRARY_PATH /usr/lib/x86_64-linux-gnu/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib \
-        --setenv VK_ICD_FILENAMES /usr/share/vulkan/icd.d/lvp_icd.json \
-        --setenv WINEDEBUG -all \
-        "$WINE64" "$@"
-}
-
-# Initialize WINEPREFIX
-run_wine wineboot.exe -u 2>&1 | tail -10
-
-# Copy zlib1.dll to system32 (not done automatically by Wine)
-cp "$PREFIX/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/zlib1.dll" \
-   "$WINEPREFIX/drive_c/windows/system32/" 2>/dev/null
-
-# Force X11 graphics driver
-run_wine reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d x11 /f 2>&1 | tail -2
-
-echo "OK: WINEPREFIX ready at $WINEPREFIX"
-```
-
-#### Step 9: Run the DX9 Program
-
-```bash
-# Replace with your EXE path
-YOUR_EXE="/home/z/my-project/sandbox/dx9_test.exe"
-
-# Run in background (to allow taking screenshots during execution)
-nohup bash -c '
-BWRAP="'"$PREFIX"'/usr/bin/bwrap"
-WINE64="'"$PREFIX"'/usr/lib/wine/wine64"
-"$BWRAP" \
-    --ro-bind /usr /host-usr \
-    --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
-    --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /etc /etc \
-    --bind /tmp /tmp \
-    --bind /home/z/my-project /home/z/my-project \
-    --bind "'"$ROOTFS"'"/usr /usr \
-    --ro-bind "'"$PREFIX"'"/usr/lib/wine /usr/lib/wine \
-    --ro-bind "'"$PREFIX"'"/usr/lib/x86_64-linux-gnu/wine /usr/lib/x86_64-linux-gnu/wine \
-    --ro-bind "'"$PREFIX"'"/usr/share/wine /usr/share/wine \
-    --ro-bind "'"$PREFIX"'"/usr/share/vulkan /usr/share/vulkan \
-    --proc /proc \
-    --dev /dev \
-    --setenv DISPLAY :99 \
-    --setenv WINEPREFIX "'"$WINEPREFIX"'" \
-    --setenv LD_LIBRARY_PATH /usr/lib/x86_64-linux-gnu/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib \
-    --setenv VK_ICD_FILENAMES /usr/share/vulkan/icd.d/lvp_icd.json \
-    --setenv WINEDEBUG -all \
-    "$WINE64" "'"$YOUR_EXE"'"
-' > /tmp/wine_run.log 2>&1 &
-disown
-WINE_PID=$!
-
-# Wait a few seconds for the program to initialize
-sleep 4
-
-echo "Wine PID: $WINE_PID"
-ps -p $WINE_PID > /dev/null && echo "OK: running" || echo "FAIL: stopped"
-```
-
-#### Step 10: Capture Screenshot
-
-```bash
-# Create screenshot script
-cat > /home/z/my-project/scripts/screenshot.py <<'PYEOF'
-#!/usr/bin/env python3
-"""Captures a screenshot of an X11 display using Xlib + Pillow."""
-import sys, os
-
-# Add common Python virtualenv paths
-for p in ['/home/z/.venv/lib/python3.12/site-packages',
-          '/home/z/.local/lib/python3.13/site-packages',
-          os.path.expanduser('~/.local/lib/python3') + '.12/site-packages']:
-    if os.path.isdir(p):
-        sys.path.insert(0, p)
-
-import ctypes
-from Xlib import X, display
-from PIL import Image
-
-display_str = sys.argv[1] if len(sys.argv) > 1 else ':99'
-out_path = sys.argv[2] if len(sys.argv) > 2 else '/tmp/screenshot.png'
-
-d = display.Display(display_str)
-root = d.screen().root
-geom = root.get_geometry()
-print(f'Root geometry: {geom.width}x{geom.height} depth={geom.depth}')
-
-plane_mask = 0xFFFFFFFF
-image = root.get_image(0, 0, geom.width, geom.height, X.ZPixmap, plane_mask)
-print(f'Image data: {len(image.data)} bytes, depth={image.depth}')
-
-if image.depth == 24:
-    img = Image.frombytes('RGB', (geom.width, geom.height), image.data, 'raw', 'BGRX')
-elif image.depth == 32:
-    img = Image.frombytes('RGBA', (geom.width, geom.height), image.data, 'raw', 'BGRA')
-elif image.depth == 16:
-    img = Image.frombytes('RGB', (geom.width, geom.height), image.data, 'raw', 'BGR;16')
-else:
-    print(f'Unsupported depth: {image.depth}')
-    sys.exit(1)
-
-img.save(out_path)
-print(f'Screenshot saved to {out_path}')
-PYEOF
-
-# Run screenshot
-mkdir -p /home/z/my-project/download
-python3 /home/z/my-project/scripts/screenshot.py :99 /home/z/my-project/download/screenshot.png
-
-# Kill wine afterwards
-pkill -9 -f 'wine64.*\.exe' 2>/dev/null
-```
+1. **ALL output is JSON on stdout.** Parse with `json.loads()`. Warnings go to stderr.
+2. **`--session` is required** for input commands (click, key, type, clipboard) when multiple sessions are active. Returns `AMBIGUOUS_SESSION` error otherwise.
+3. **`exe_path` accepts both formats**: Unix (`/home/z/app.exe`) and Windows (`C:\windows\system32\notepad.exe`).
+4. **The `arch` field** in the exec response tells you if the EXE ran as 32-bit or 64-bit.
+5. **Session cache** lives at `~/.cache/headlesslab/` (registry.json, debug.log, per-session dirs).
+6. **Dead sessions are preserved** — `headless list` shows them with `state: "dead"` so you can still read their logs.
+7. **EXE write paths** are limited to the Wine prefix (`C:\users\...`). Writing to `Z:\home\...` is not supported by the bwrap sandbox.
+8. **Console app output** (e.g., `cmd.exe /c echo Hello`, `sigcheck`, `ipconfig`) is captured in `headless logs`. UTF-16 output is auto-decoded.
 
 ---
 
-## 🐛 DEBUGGING — Common Problems and Solutions
+## 🐛 Debugging — Common Problems
 
-### Issue: `wine: could not load ntdll.so: (null)`
+### Problem: `headless --verify` fails with "Xvfb did not create socket"
 
-**Cause:** Bubblewrap run without `--proc /proc`. Wine relies on `/proc/self/exe` to locate its shared object binaries.
+**Cause**: Xvfb is not installed or not running.
 
-**Solution:** Ensure the bwrap command includes `--proc /proc`:
+**Solution**:
 ```bash
-... --proc /proc --dev /dev ...
+# Install Xvfb (requires sudo — it's the one host dep that needs kernel access)
+sudo apt-get install -y xvfb
+
+# Verify it's on PATH
+which Xvfb
 ```
 
-### Issue: `Library zlib1.dll not found`
+### Problem: `wait-window` always times out
 
-**Cause:** `zlib1.dll` is missing from the wineprefix system32 directory.
+**Cause 1**: Openbox can't find its themes (common when host tools are installed in `~/.local/`).
 
-**Solution:** Copy it manually:
+**Diagnosis**: Check `~/.cache/headlesslab/debug.log` and `/tmp/openbox.log` for "Unable to load the theme".
+
+**Solution**: The `headless init` command auto-sets `XDG_DATA_DIRS` to include `~/.local/usr/share`. If you're running Openbox manually, set it yourself:
 ```bash
-cp "$PREFIX/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/zlib1.dll" \
-   "$WINEPREFIX/drive_c/windows/system32/"
+export XDG_DATA_DIRS="$HOME/.local/usr/share:/usr/share:/usr/local/share"
 ```
 
-### Issue: `Application tried to create a window, but no driver could be loaded`
+**Cause 2**: The app crashed immediately after launch.
 
-**Cause 1:** Xvfb is not running.
+**Diagnosis**: Run `headless logs <session_id>` — if it shows `WINE_DIED`, the EXE crashed. Check the log tail for the specific error.
+
+### Problem: `wine: failed to load L"\\??\\C:\\windows\\syswow64\\ntdll.dll" error c0000135`
+
+**Cause**: You're trying to run a 32-bit (PE32 i386) EXE, but 32-bit support is not installed.
+
+**Solution**: Run `bash bin/setup-32bit.sh` (build-from-source) or use the AppImage (which includes 32-bit support).
+
+### Problem: `wine: could not load ntdll.so: (null)`
+
+**Cause**: Bubblewrap was run without `--proc /proc`. Wine relies on `/proc/self/exe` to locate its shared object binaries.
+
+**Solution**: This is handled automatically by the `headless` CLI. If you're running bwrap manually, ensure `--proc /proc` is included.
+
+### Problem: `Application tried to create a window, but no driver could be loaded`
+
+**Cause 1**: Xvfb is not running. Check with `pgrep -f "Xvfb"`.
+
+**Cause 2**: Wrong DISPLAY variable. Check that the DISPLAY matches the Xvfb instance.
+
+**Cause 3**: X11 Unix socket is inaccessible. Ensure `--bind /tmp /tmp` is included in the bwrap command.
+
+### Problem: `Initialization of winex11.drv failed`
+
+**Cause**: Xvfb was started without the `-ac` flag (restricting access).
+
+**Solution**: The `headless init` command starts Xvfb with `-ac` automatically. If running Xvfb manually:
 ```bash
-pgrep -f "Xvfb :99"  # Must return a PID
+Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp
 ```
 
-**Cause 2:** Wrong DISPLAY variable configured inside the bwrap.
-```bash
-# Check if the DISPLAY matches the Xvfb instance (e.g., :99)
-echo $DISPLAY
-```
+### Problem: DX9 `CreateDevice` returns S_OK but screenshot is blank
 
-**Cause 3:** X11 Unix socket is inaccessible. Ensure `--bind /tmp /tmp` is included in the bwrap command.
+**Cause**: Culling, lighting, or z-buffer is hiding the rendered geometry.
 
-### Issue: `Initialization of winex11.drv failed`
-
-**Cause:** Xvfb was started without the `-ac` flag (restricting access).
-
-**Solution:** Restart Xvfb with the `-ac` flag:
-```bash
-pkill -9 Xvfb; sleep 1
-setsid Xvfb :99 -screen 0 1024x768x24 -ac -nolisten tcp </dev/null >/tmp/xvfb.log 2>&1 &
-disown
-sleep 2
-```
-
-### Issue: DX9 `CreateDevice` returns S_OK but screenshot is blank
-
-**Cause:** Culling, lighting, or z-buffer is hiding the rendered geometry.
-
-**Solution:** In your DX9 program, set the following render states:
+**Solution**: In your DX9 program, set the following render states:
 ```cpp
 g_device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
 g_device->SetRenderState(D3DRS_LIGHTING, FALSE);
@@ -581,71 +351,75 @@ g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 g_device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
 ```
 
-### Issue: Triangle renders with incorrect colors or pixelation
+### Problem: Screenshot shows 0 or 1 unique colors (blank screen)
 
-**Cause:** Mesa llvmpipe is failing to load, falling back to a dummy driver. Check the renderer log:
-```bash
-# The log should output "llvmpipe" as the active renderer
-WINEDEBUG=+d3d ./bin/headless exec examples/dx9_triangle.exe 2>&1 | grep -i renderer
+**Diagnosis**: Analyze the screenshot programmatically:
+```python
+from PIL import Image
+img = Image.open('/tmp/capture.png')
+colors = img.getcolors(maxcolors=1024*1024)
+n = len(colors) if colors else 0
+# n > 100: rendering succeeded
+# n <= 100: blank/failed render
 ```
 
-### Issue: Wine runs but `WINEDLLOVERRIDES=d3d9=native` breaks graphics
+**Cause**: The app didn't render anything, or the window hasn't stabilized yet. Increase `wait-window --timeout` or check if the app showed an error dialog.
 
-**Cause:** DXVK does not ship a PE version of `d3d9.dll`, only the unix-side `.so` library.
+### Problem: `bwrap: execvp .../wine64: No such file or directory` but the file exists
 
-**Solution:** **DO NOT use DXVK**. Use Wine's built-in `d3d9.dll` + Mesa llvmpipe, which works perfectly for DX9 software rendering.
+**Cause**: The wine64 wrapper is a `#!/bin/sh` script, but `/bin/sh` or its libraries are not accessible inside the bwrap sandbox.
+
+**Solution**: This is handled by the `headless` CLI's bwrap configuration. If running bwrap manually, ensure `--ro-bind /bin /bin` and `--ro-bind /lib /lib` are included.
 
 ---
 
-## 📊 POST-EXECUTION ANALYSIS
+## 📊 Post-Execution Analysis
 
-### Checking if Rendering Occurred
+### Checking if rendering occurred
 
 ```python
 from PIL import Image
-img = Image.open('/home/z/my-project/download/screenshot.png')
+img = Image.open('/tmp/capture.png')
 colors = img.getcolors(maxcolors=1024*1024)
 if colors:
-    print(f'Unique colors: {len(colors)}')
-    # If > 100 colors, rendering succeeded (gradient on the triangle)
-    # If 1 or 2 colors, it rendered background/blank screen
+    n = len(colors)
+    print(f'Unique colors: {n}')
+    # n > 100: rendering succeeded
+    # n <= 100: blank screen / failed render
     print(f'Top 5: {sorted(colors, reverse=True)[:5]}')
 ```
 
-### Expected Clean Logs
+### Verifying animation (two screenshots should differ)
 
-```
-=== DX9 Test Program ===
-[OK] Window created HWND=... (800x600 client area)
-[OK] Direct3DCreate9 succeeded. D3D pointer=...
-[INFO] Adapter count: 1
-  Adapter 0: NVIDIA GeForce GTX 470 (driver nvd3dum.dll, ...)
-[OK] Direct3D device created. Device=..., hr=0x00000000
-[OK] Vertex buffer created.
-[OK] Setup complete. Entering message loop.
-[INFO] First Clear hr=0x00000000
-[INFO] BeginScene hr=0x00000000
-[INFO] DrawPrimitive hr=0x00000000
-[INFO] EndScene hr=0x00000000
-[INFO] First Present hr=0x00000000
+```python
+import hashlib
+with open('/tmp/shot1.png', 'rb') as f: h1 = hashlib.md5(f.read()).hexdigest()
+with open('/tmp/shot2.png', 'rb') as f: h2 = hashlib.md5(f.read()).hexdigest()
+print(f'Shots are {"DIFFERENT (animating)" if h1 != h2 else "IDENTICAL (static)"}')
 ```
 
 ---
 
-## ⚠️ KNOWN LIMITATIONS
+## ⚠️ Known Limitations
 
-1. **No 32-bit (x86)**: Standard Win32 (32-bit) programs will not run. Support requires adding i386 host architecture (`dpkg --add-architecture i386`), which requires root.
-2. **Performance**: ~5-10 fps on llvmpipe software rendering. Unsuitable for real-time play, but perfect for headless test suites and screenshooting.
-3. **No Audio**: Wine ALSA configuration is omitted.
-4. **No DX10/DX11/DX12**: Limited strictly to DX9. Higher versions require DXVK and a physical Vulkan-capable GPU.
+1. **No 16-bit Windows**: Wine 9.0+ removed 16-bit support. Only PE32 (i386) and PE32+ (x86-64) are supported.
+2. **Performance**: ~5-10 fps on llvmpipe software rendering. Suitable for screenshots and functional validation, not real-time gaming.
+3. **No audio**: Wine ALSA configuration is omitted (silent operation). Apps that require audio may fail or hang.
+4. **No DX10/DX11/DX12**: Limited to DX9. Higher versions require DXVK and a physical Vulkan-capable GPU.
+5. **Xvfb requires sudo**: Xvfb is the one host dependency that cannot be bundled (needs kernel DRM/KMS access).
+6. **EXE write paths**: Windows apps can only write to paths inside the Wine prefix (`C:\users\...`). Writing to `Z:\home\...` is not supported by the bwrap sandbox.
+7. **OpenGL performance for 32-bit apps**: Wine's WoW64 mode has reduced OpenGL performance for 32-bit apps. Since WineD3D translates Direct3D 9 → OpenGL, 32-bit DX9 apps may see lower FPS than 64-bit equivalents.
+8. **AppImage size**: The AppImage is ~454MB (includes Wine 10 + Mesa + LLVM + 32-bit support). This is the tradeoff for zero compilation.
 
 ---
 
-## 🎯 FINAL CHECKLIST
+## 🎯 Final Checklist
 
-Verify these items before declaring completion:
-- [ ] Xvfb is running: `pgrep -f "Xvfb :99"` returns a PID
-- [ ] WINEPREFIX initialized: `ls $WINEPREFIX/drive_c/windows/system32/user32.dll` exists
-- [ ] zlib1.dll present: `ls $WINEPREFIX/drive_c/windows/system32/zlib1.dll` exists
-- [ ] Graphics driver set to x11: check `user.reg` contains `"Graphics"="x11"`
-- [ ] Screenshot shows > 100 unique colors (rendering occurred)
+Before declaring a task complete, verify:
+
+- [ ] `headless init` returned `{"status": "ok", ...}` with a display number
+- [ ] `headless exec` returned `{"status": "ok", "session_id": "sess_...", "arch": "..."}`
+- [ ] `headless wait-window` returned `{"status": "ok", "elapsed_ms": ...}` (not `timeout`)
+- [ ] `headless screenshot` produced a PNG file with > 100 unique colors
+- [ ] `headless kill` returned `{"status": "ok", "killed_pids": [...]}` (non-empty list)
+- [ ] `headless list` shows no leftover running sessions

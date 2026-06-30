@@ -10,6 +10,10 @@ HeadlessLab provides a unified Python CLI (`headless`) that lets AI agents and a
 [![Platform: Debian 13](https://img.shields.io/badge/Platform-Debian%2013-blue)](https://www.debian.org/)
 [![Wine 10.0](https://img.shields.io/badge/Wine-10.0-green)](https://www.winehq.org/)
 
+![Notepad running under Wine via HeadlessLab](examples/notepad_demo.png)
+
+*Windows `notepad.exe` running headless under Wine + Xvfb + Mesa llvmpipe, with text typed via `headless type "Hello from headless CLI!"`.*
+
 ---
 
 ## Quick Start (Recommended: Download AppImage — no compilation needed)
