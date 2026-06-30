@@ -1,0 +1,1310 @@
+#!/usr/bin/env python3
+# headless — Unified CLI tool for AI agents to control Windows GUI apps under Wine + Xvfb + bwrap.
+import os
+import sys
+import json
+import time
+import subprocess
+import argparse
+import hashlib
+import shutil
+from datetime import datetime, timezone
+
+# --- Registry & Cache Paths ---
+CACHE_DIR = os.path.expanduser("~/.cache/headlesslab")
+REGISTRY_PATH = os.path.join(CACHE_DIR, "registry.json")
+DEBUG_LOG_PATH = os.path.join(CACHE_DIR, "debug.log")
+
+def iso_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def debug_log(msg):
+    """Append a debug line to the rotating debug log (capped at 1MB)."""
+    try:
+        os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
+        # Rotate if too big
+        if os.path.exists(DEBUG_LOG_PATH) and os.path.getsize(DEBUG_LOG_PATH) > 1024 * 1024:
+            shutil.move(DEBUG_LOG_PATH, DEBUG_LOG_PATH + ".old")
+        with open(DEBUG_LOG_PATH, "a") as f:
+            f.write(f"[{iso_now()}] {msg}\n")
+    except Exception:
+        pass
+
+class SessionRegistry:
+    @staticmethod
+    def _load():
+        if not os.path.exists(REGISTRY_PATH):
+            return {"sessions": {}}
+        try:
+            with open(REGISTRY_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {"sessions": {}}
+
+    @staticmethod
+    def _save(data):
+        os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
+        with open(REGISTRY_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+
+    @classmethod
+    def register(cls, session_id, pid, display, wineprefix, log_path):
+        data = cls._load()
+        data["sessions"][session_id] = {
+            "pid": pid,
+            "display": display,
+            "wineprefix": wineprefix,
+            "log_path": log_path,
+            "created_at": iso_now(),
+            "state": "running"
+        }
+        cls._save(data)
+
+    @classmethod
+    def get(cls, session_id):
+        data = cls._load()
+        return data["sessions"].get(session_id)
+
+    @classmethod
+    def list_all(cls):
+        data = cls._load()
+        return data["sessions"]
+
+    @classmethod
+    def unregister(cls, session_id):
+        data = cls._load()
+        if session_id in data["sessions"]:
+            del data["sessions"][session_id]
+            cls._save(data)
+
+
+# --- Helper Functions ---
+
+def print_json(data):
+    print(json.dumps(data), flush=True)
+
+def print_error(code, message, exit_code=1):
+    print_json({"status": "error", "code": code, "message": message})
+    sys.exit(exit_code)
+
+def get_appdir():
+    # If running inside AppImage, APPDIR is defined by the runtime
+    return os.environ.get("APPDIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def get_prefix_dir():
+    if "APPDIR" in os.environ:
+        return os.environ["APPDIR"]
+    else:
+        return os.path.join(get_appdir(), "prefix")
+
+
+def detect_pe_arch(exe_path):
+    """Detect the architecture of a Windows PE binary by reading the COFF
+    'Machine' field at offset 0x3C+4. Returns 'i386', 'x86_64', or 'unknown'.
+    Used to decide whether to use wine64 (for x86_64 PE) or wine (for i386 PE
+    via WoW64). For Windows-style paths (C:\\...) we can't read the file
+    directly, so we return 'unknown' and let Wine auto-detect."""
+    try:
+        with open(exe_path, "rb") as f:
+            # MZ header: first 2 bytes should be b"MZ"
+            if f.read(2) != b"MZ":
+                return "unknown"
+            # e_lfanew at offset 0x3C points to PE header
+            f.seek(0x3C)
+            pe_offset = int.from_bytes(f.read(4), "little")
+            f.seek(pe_offset)
+            # PE signature: "PE\0\0"
+            if f.read(4) != b"PE\x00\x00":
+                return "unknown"
+            # Next 2 bytes: Machine field
+            machine = int.from_bytes(f.read(2), "little")
+            if machine == 0x14C:    # IMAGE_FILE_MACHINE_I386
+                return "i386"
+            elif machine == 0x8664: # IMAGE_FILE_MACHINE_AMD64
+                return "x86_64"
+            elif machine == 0xAA64: # IMAGE_FILE_MACHINE_ARM64
+                return "arm64"
+            elif machine == 0x1C0:  # IMAGE_FILE_MACHINE_ARM
+                return "arm"
+            else:
+                return f"unknown(0x{machine:04x})"
+    except Exception:
+        return "unknown"
+
+
+def get_wine_binary_for_arch(arch):
+    """Return the Wine binary path (INSIDE the bwrap sandbox) to use for a given
+    PE architecture. The path is always /usr/lib/wine/wine64 because:
+    - For x86_64 PE: wine64 directly executes the 64-bit loader.
+    - For i386 PE: wine64 dispatches to Wine's WoW64 mode (Wine 9.0+), which
+      runs 32-bit PE binaries via PE-only thunks without needing i386 unix libs.
+    The bwrap sandbox has /usr/lib/wine bind-mounted from the prefix, so this
+    path resolves correctly inside the sandbox."""
+    # Path INSIDE the bwrap sandbox (NOT the host path)
+    return "/usr/lib/wine/wine64"
+
+def find_free_display():
+    for i in range(99, 200):
+        lock_file = f"/tmp/.X{i}-lock"
+        unix_socket = f"/tmp/.X11-unix/X{i}"
+        if not os.path.exists(lock_file) and not os.path.exists(unix_socket):
+            return f":{i}"
+    raise RuntimeError("No free displays found")
+
+def get_pids_for_prefix(wineprefix):
+    pids = []
+    for pid_str in os.listdir("/proc"):
+        if not pid_str.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid_str}/environ", "rb") as f:
+                environ_bytes = f.read()
+            env = {}
+            for item in environ_bytes.split(b"\x00"):
+                if b"=" in item:
+                    parts = item.split(b"=", 1)
+                    env[parts[0].decode("utf-8", errors="ignore")] = parts[1].decode("utf-8", errors="ignore")
+            if env.get("WINEPREFIX") == wineprefix:
+                pids.append(int(pid_str))
+        except Exception:
+            continue
+    return pids
+
+def get_windows_for_session(display, session_pids):
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    try:
+        res = subprocess.run(["wmctrl", "-l", "-p"], env=env, capture_output=True, text=True)
+        # Use the rotating debug_log instead of an unbounded /tmp file
+        debug_log(f"get_windows_for_session: session_pids={session_pids}")
+        debug_log(f"get_windows_for_session: wmctrl output:\n{res.stdout}")
+        if res.returncode != 0:
+            return []
+        windows = []
+        for line in res.stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) >= 4:
+                w_id = parts[0]
+                pid = int(parts[2])
+                title = parts[4] if len(parts) > 4 else ""
+                if pid in session_pids:
+                    windows.append({"id": w_id, "pid": pid, "title": title})
+        return windows
+    except Exception as e:
+        debug_log(f"get_windows_for_session exception: {e}")
+        return []
+
+
+def rebuild_rootfs(rootfs):
+    import shutil
+    if os.path.exists(rootfs):
+        try:
+            shutil.rmtree(rootfs)
+        except Exception:
+            pass
+        
+    os.makedirs(f"{rootfs}/usr/lib", exist_ok=True)
+    os.makedirs(f"{rootfs}/usr/lib/x86_64-linux-gnu", exist_ok=True)
+    os.makedirs(f"{rootfs}/usr/share", exist_ok=True)
+    os.makedirs(f"{rootfs}/usr/bin", exist_ok=True)
+    os.makedirs(f"{rootfs}/usr/sbin", exist_ok=True)
+    
+    # Symlinks for /usr/lib/* (skipping wine and x86_64-linux-gnu)
+    for name in os.listdir("/usr/lib"):
+        if name in ["wine", "x86_64-linux-gnu"]:
+            continue
+        try:
+            os.symlink(f"/host-usr/lib/{name}", f"{rootfs}/usr/lib/{name}")
+        except Exception:
+            pass
+        
+    # Symlinks for /usr/lib/x86_64-linux-gnu/* (skipping wine)
+    for name in os.listdir("/usr/lib/x86_64-linux-gnu"):
+        if name == "wine":
+            continue
+        try:
+            os.symlink(f"/host-usr/lib/x86_64-linux-gnu/{name}", f"{rootfs}/usr/lib/x86_64-linux-gnu/{name}")
+        except Exception:
+            pass
+        
+    # Symlinks for /usr/share/* (skipping wine and vulkan)
+    for name in os.listdir("/usr/share"):
+        if name in ["wine", "vulkan"]:
+            continue
+        try:
+            os.symlink(f"/host-usr/share/{name}", f"{rootfs}/usr/share/{name}")
+        except Exception:
+            pass
+        
+    # Symlinks for /usr/bin/* and /usr/sbin/*
+    for name in os.listdir("/usr/bin"):
+        try:
+            os.symlink(f"/host-usr/bin/{name}", f"{rootfs}/usr/bin/{name}")
+        except Exception:
+            pass
+    for name in os.listdir("/usr/sbin"):
+        try:
+            os.symlink(f"/host-usr/sbin/{name}", f"{rootfs}/usr/sbin/{name}")
+        except Exception:
+            pass
+        
+    # Base directories of rootfs
+    for d in ["bin", "sbin", "lib", "lib64", "etc"]:
+        try:
+            os.symlink(f"/host-{d}", f"{rootfs}/{d}")
+        except Exception:
+            pass
+        
+    # Create empty folders that will be bind-mounted (bwrap populates them)
+    os.makedirs(f"{rootfs}/usr/lib/wine", exist_ok=True)
+    os.makedirs(f"{rootfs}/usr/lib/x86_64-linux-gnu/wine", exist_ok=True)
+    os.makedirs(f"{rootfs}/usr/lib/i386-linux-gnu/wine", exist_ok=True)  # for 32-bit WoW64
+    os.makedirs(f"{rootfs}/usr/share/wine", exist_ok=True)
+    os.makedirs(f"{rootfs}/usr/share/vulkan", exist_ok=True)
+
+
+# --- CLI Command Implementations ---
+
+def _start_display(display, geometry):
+    """Shared helper: launches Xvfb + Openbox on the given display.
+    Sets XDG_DATA_DIRS so Openbox can find its themes (critical when host
+    packages are installed in ~/.local/usr instead of /usr).
+    Returns (success: bool, error_message: str)."""
+    xvfb_log = open("/tmp/xvfb.log", "a")
+
+    # 1. Launch Xvfb
+    try:
+        subprocess.Popen(
+            ["Xvfb", display, "-screen", "0", geometry, "-ac", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=xvfb_log,
+            preexec_fn=os.setsid
+        )
+    except FileNotFoundError:
+        return False, "Xvfb binary not found on host PATH. Install with: apt-get install xvfb"
+    except Exception as e:
+        return False, f"Failed to start Xvfb: {e}"
+
+    time.sleep(2)  # wait for startup
+
+    # Verify Xvfb is actually running
+    if not os.path.exists(f"/tmp/.X11-unix/X{display.lstrip(':')}"):
+        with open("/tmp/xvfb.log", "r", errors="ignore") as f:
+            log_tail = f.read()[-500:]
+        return False, f"Xvfb did not create socket. Log tail: {log_tail}"
+
+    # 2. Launch Openbox — XDG_DATA_DIRS must include any prefix where themes live
+    # (e.g. ~/.local/usr/share when host tools were installed via apt-get download)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    xdg = env.get("XDG_DATA_DIRS", "")
+    extra_dirs = []
+    home_local_share = os.path.expanduser("~/.local/usr/share")
+    if os.path.isdir(home_local_share) and home_local_share not in xdg:
+        extra_dirs.append(home_local_share)
+    for d in ["/usr/share", "/usr/local/share"]:
+        if d not in xdg:
+            extra_dirs.append(d)
+    env["XDG_DATA_DIRS"] = ":".join(extra_dirs + ([xdg] if xdg else []))
+
+    openbox_log = open("/tmp/openbox.log", "a")
+    try:
+        subprocess.Popen(
+            ["openbox", "--sm-disable"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=openbox_log,
+            preexec_fn=os.setsid
+        )
+    except FileNotFoundError:
+        return False, "openbox binary not found on host PATH. Install with: apt-get install openbox"
+    except Exception as e:
+        return False, f"Failed to start openbox: {e}"
+
+    time.sleep(1)
+
+    # 3. Pin keyboard layout to us
+    subprocess.run(["setxkbmap", "us"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return True, ""
+
+
+def cmd_init(args):
+    try:
+        display = find_free_display()
+    except Exception as e:
+        print_error("NO_FREE_DISPLAY", str(e))
+
+    # Respect --geometry (was previously hardcoded to 1920x1080x24)
+    geometry = args.geometry or "1920x1080x24"
+
+    ok, err = _start_display(display, geometry)
+    if not ok:
+        print_error("INIT_FAILED", err)
+
+    print_json({"status": "ok", "display": display, "geometry": geometry})
+
+
+def cmd_exec(args):
+    appdir = get_appdir()
+    session_id = f"sess_{int(time.time())}"
+    display = args.display
+    
+    # If no display provided, look if there is an active session's display or fallback to default
+    if not display:
+        sessions = SessionRegistry.list_all()
+        if sessions:
+            # pick the display of the first active session
+            display = list(sessions.values())[0]["display"]
+        else:
+            display = ":99"
+
+    # Setup per-session writable directories
+    session_work = os.path.join(CACHE_DIR, session_id)
+    wineprefix = os.path.join(session_work, "wineprefix")
+    rootfs = os.path.join(session_work, "rootfs")
+    log_path = f"/tmp/wine_debug_{session_id}.log"
+    os.makedirs(session_work, exist_ok=True)
+
+    # 1. Rebuild rootfs
+    try:
+        rebuild_rootfs(rootfs)
+    except Exception as e:
+        print_error("ROOTFS_FAILED", f"Failed to rebuild rootfs: {e}")
+
+    # 2. Init WINEPREFIX
+    prefix_dir = get_prefix_dir()
+    bwrap_base = [
+        f"{prefix_dir}/usr/bin/bwrap",
+        "--ro-bind", "/usr", "/host-usr",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/lib64", "/lib64",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/sbin", "/sbin",
+        "--ro-bind", "/etc", "/etc",
+        "--bind", "/tmp", "/tmp",
+        "--bind", session_work, session_work,
+        "--bind", f"{rootfs}/usr", "/usr",
+        "--ro-bind", f"{prefix_dir}/usr/lib/wine", "/usr/lib/wine",
+        "--ro-bind", f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine", "/usr/lib/x86_64-linux-gnu/wine",
+        # 32-bit (i386) Wine support via WoW64 — mount the i386-windows DLLs
+        # so 32-bit PE binaries can load them via syswow64.
+        "--ro-bind", f"{prefix_dir}/usr/lib/i386-linux-gnu/wine", "/usr/lib/i386-linux-gnu/wine",
+        "--ro-bind", f"{prefix_dir}/usr/share/wine", "/usr/share/wine",
+        "--ro-bind", f"{prefix_dir}/usr/share/vulkan", "/usr/share/vulkan",
+        "--proc", "/proc",
+        "--dev", "/dev"
+    ]
+
+    # 32-bit support: if the prefix has the patched 32-bit wine binary and
+    # ld-linux.so.2, add the extra bind mounts needed for WoW64.
+    ld_linux_32 = f"{prefix_dir}/usr/lib/ld-linux.so.2"
+    wine32_bin = f"{prefix_dir}/usr/lib/wine/wine"
+    i386_lib_dir = f"{prefix_dir}/usr/lib/i386-linux-gnu"
+    if os.path.exists(ld_linux_32) and os.path.exists(wine32_bin) and os.path.isdir(i386_lib_dir):
+        bwrap_base.extend([
+            "--ro-bind", ld_linux_32, "/usr/lib/ld-linux.so.2",
+            "--ro-bind", i386_lib_dir, "/usr/lib/i386-linux-gnu",
+        ])
+
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    env["WINEPREFIX"] = wineprefix
+    # Include i386-unix .so path so the 32-bit wine binary can find its Unix-side libs
+    ld_path = "/usr/lib/x86_64-linux-gnu/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib"
+    if os.path.isdir(f"{prefix_dir}/usr/lib/i386-linux-gnu/wine/i386-unix"):
+        ld_path = "/usr/lib/x86_64-linux-gnu/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu/wine/i386-unix:/usr/lib/i386-linux-gnu:/usr/lib"
+    env["LD_LIBRARY_PATH"] = ld_path
+    env["VK_ICD_FILENAMES"] = "/usr/share/vulkan/icd.d/lvp_icd.json"
+    env["WINEDEBUG"] = "-all"
+
+    # Run wineboot if registry not created
+    if not os.path.exists(os.path.join(wineprefix, "drive_c/windows/system32/user32.dll")):
+        os.makedirs(wineprefix, exist_ok=True)
+        try:
+            # Init wineboot
+            res = subprocess.run(bwrap_base + ["/usr/lib/wine/wine64", "wineboot.exe", "-u"], env=env, capture_output=True)
+            user32_path = os.path.join(wineprefix, "drive_c/windows/system32/user32.dll")
+            if not os.path.exists(user32_path):
+                stdout_str = res.stdout.decode("utf-8", errors="replace")
+                stderr_str = res.stderr.decode("utf-8", errors="replace")
+                print_error("WINEBOOT_FAILED", f"wineboot.exe -u failed to create prefix: stdout={stdout_str} stderr={stderr_str}")
+            # Copy zlib1.dll
+            subprocess.run(["cp", f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/zlib1.dll", f"{wineprefix}/drive_c/windows/system32/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            # Set graphics driver to x11
+            res = subprocess.run(bwrap_base + ["/usr/lib/wine/wine64", "reg", "add", "HKCU\\Software\\Wine\\Drivers", "/v", "Graphics", "/d", "x11", "/f"], env=env, capture_output=True)
+            if res.returncode != 0:
+                stdout_str = res.stdout.decode("utf-8", errors="replace")
+                stderr_str = res.stderr.decode("utf-8", errors="replace")
+                print_error("REG_ADD_FAILED", f"reg add failed: stdout={stdout_str} stderr={stderr_str}")
+            
+            # Symlink duplicate dlls to save space
+            sys32 = f"{wineprefix}/drive_c/windows/system32"
+            src_dir = f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine/x86_64-windows"
+            for f in os.listdir(sys32):
+                fp = os.path.join(sys32, f)
+                if os.path.isfile(fp) and f != "zlib1.dll":
+                    if os.path.exists(os.path.join(src_dir, f)):
+                        os.remove(fp)
+                        os.symlink(f"/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/{f}", fp)
+
+            # 32-bit (WoW64) support: populate syswow64/ with symlinks to i386-windows DLLs.
+            # Debian's wine64 alone does NOT populate syswow64 (it requires wine32:i386
+            # installed via multiarch). We work around this by manually creating symlinks
+            # from syswow64/<dll> -> /usr/lib/i386-linux-gnu/wine/i386-windows/<dll>.
+            # This is only done if the i386-windows DLLs are present in the prefix
+            # (i.e., the user ran the 32-bit setup script).
+            i386_src = f"{prefix_dir}/usr/lib/i386-linux-gnu/wine/i386-windows"
+            # Also check the x86_64-linux-gnu/wine/i386-windows/ dir (where build-from-scratch
+            # might place them)
+            i386_src_alt = f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine/i386-windows"
+            i386_dir = i386_src if os.path.isdir(i386_src) else (i386_src_alt if os.path.isdir(i386_src_alt) else None)
+            if i386_dir:
+                syswow = f"{wineprefix}/drive_c/windows/syswow64"
+                os.makedirs(syswow, exist_ok=True)
+                # Determine the in-sandbox path for the symlink target
+                if i386_dir == i386_src:
+                    target_base = "/usr/lib/i386-linux-gnu/wine/i386-windows"
+                else:
+                    target_base = "/usr/lib/x86_64-linux-gnu/wine/i386-windows"
+                populated = 0
+                for f in os.listdir(i386_dir):
+                    fp = os.path.join(syswow, f)
+                    # Only create symlink if file doesn't exist or is a regular file
+                    if not os.path.lexists(fp) or (os.path.isfile(fp) and not os.path.islink(fp)):
+                        try:
+                            if os.path.lexists(fp):
+                                os.remove(fp)
+                            os.symlink(f"{target_base}/{f}", fp)
+                            populated += 1
+                        except Exception:
+                            pass
+                debug_log(f"Populated syswow64/ with {populated} i386 DLL symlinks from {target_base}")
+        except Exception as e:
+            print_error("WINEBOOT_FAILED", f"Failed to initialize Wine prefix: {e}")
+
+    # 3. Launch the User application
+    # Support three forms of exe_path:
+    #   (a) Windows-style path inside the Wine prefix:  C:\windows\system32\notepad.exe
+    #       (or any drive letter X:\... that exists in dosdevices). Translated to
+    #       the host path under wineprefix/drive_X/... and passed through.
+    #   (b) Unix absolute path on the host:  /home/z/my.exe  (must exist on host)
+    #   (c) Relative path: resolved against cwd.
+    exe_path = args.exe_path
+    windows_path = None  # set if exe_path is a Windows-style path
+
+    # Detect Windows-style path: <letter>:\...  (case-insensitive drive letter)
+    if len(exe_path) >= 3 and exe_path[1] == ":" and exe_path[2] == "\\" and exe_path[0].isalpha():
+        windows_path = exe_path.replace("\\", "/")  # Wine accepts forward slashes too
+        # Translate C:\... -> wineprefix/drive_c/...  (lower-case drive letter)
+        drive_letter = exe_path[0].lower()
+        host_path = os.path.join(wineprefix, f"drive_{drive_letter}", exe_path[3:].replace("\\", "/"))
+        # Use os.path.lexists (not exists) so broken symlinks still pass — many
+        # wineprefix system32 DLLs are symlinks to /usr/lib/... which only resolve
+        # inside the bwrap sandbox.
+        if os.path.lexists(host_path):
+            exe_path = host_path
+        else:
+            # Even if the host can't resolve the symlink, Wine will resolve it
+            # inside the sandbox. Trust the user and pass the Windows path through.
+            debug_log(f"Windows path {windows_path} -> host path {host_path} not directly resolvable, passing Windows path to Wine")
+    else:
+        if not os.path.isabs(exe_path):
+            exe_path = os.path.abspath(exe_path)
+        if not os.path.exists(exe_path):
+            print_error("EXE_NOT_FOUND", f"Executable {exe_path} not found")
+
+    # Detect PE architecture (i386 vs x86_64) — Wine 10's WoW64 mode handles
+    # 32-bit PE binaries via the same wine64 binary, so we always use wine64.
+    # The detection is reported in the JSON response so agents know which mode ran.
+    if windows_path:
+        pe_arch = "unknown"  # can't read the file from host
+    else:
+        pe_arch = detect_pe_arch(exe_path)
+    wine_binary = get_wine_binary_for_arch(pe_arch)
+
+    exe_dir = os.path.dirname(exe_path) if not windows_path else None
+
+    # Re-build BWRAP arguments to include user exe path binding (only for host paths)
+    if windows_path:
+        # Pass the Windows path as-is to Wine — Wine resolves it inside the sandbox
+        bwrap_run = bwrap_base + [
+            wine_binary, windows_path
+        ] + args.args
+    else:
+        bwrap_run = bwrap_base + [
+            "--bind", exe_dir, exe_dir,
+            wine_binary, exe_path
+        ] + args.args
+
+    # Capture logs: redirect BOTH stdout and stderr of the EXE to the log file
+    # (previously stdout went to /dev/null, hiding the EXE's own printf output)
+    env["WINEDEBUG"] = "-all,+debugstr"
+    log_file = open(log_path, "w")
+    try:
+        proc = subprocess.Popen(
+            bwrap_run,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid
+        )
+    except Exception as e:
+        print_error("LAUNCH_FAILED", f"Failed to launch process: {e}")
+
+    # Wait briefly and find surviving PID under this prefix
+    time.sleep(2)
+    pids = get_pids_for_prefix(wineprefix)
+    root_pid = proc.pid
+    if pids:
+        # Pick the actual wine64 process (not winedevice/wineserver) when possible
+        wine_main = None
+        for p in pids:
+            try:
+                with open(f"/proc/{p}/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                if "wine64" in cmdline and ".exe" in cmdline:
+                    wine_main = p
+                    break
+            except Exception:
+                continue
+        root_pid = wine_main or pids[0]
+
+    # Validate that the wine process survived — if it died, surface the error
+    if not os.path.exists(f"/proc/{root_pid}"):
+        # The bwrap may still be alive briefly; check it
+        if not os.path.exists(f"/proc/{proc.pid}"):
+            log_tail = ""
+            try:
+                with open(log_path, "r", errors="ignore") as f:
+                    log_tail = f.read()[-1500:]
+            except Exception:
+                pass
+            SessionRegistry.register(session_id, root_pid, display, wineprefix, log_path)
+            print_error("WINE_DIED", f"Wine process exited immediately. Log tail: {log_tail}")
+
+    # Write to registry
+    SessionRegistry.register(session_id, root_pid, display, wineprefix, log_path)
+
+    # Report architecture so the agent knows whether the EXE ran as 32-bit or 64-bit
+    print_json({"status": "ok", "session_id": session_id, "pid": root_pid, "arch": pe_arch})
+
+
+def _resolve_display(args, required_session=False):
+    """Resolve display from --session (preferred) or --display, falling back to
+    the first active session only if neither is provided.
+    If required_session=True, raise if no session can be resolved (used by input
+    commands where ambiguity between multiple sessions is dangerous)."""
+    session_id = getattr(args, "session", None)
+    display = getattr(args, "display", None)
+
+    if session_id:
+        sess = SessionRegistry.get(session_id)
+        if not sess:
+            print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+        return sess["display"]
+
+    if display:
+        return display
+
+    sessions = SessionRegistry.list_all()
+    if not sessions:
+        print_error("NO_SESSION", "No active sessions. Run 'headless exec' first or pass --session.")
+    if required_session and len(sessions) > 1:
+        ids = list(sessions.keys())
+        print_error("AMBIGUOUS_SESSION", f"Multiple sessions active ({len(sessions)}). Pass --session explicitly. IDs: {ids}")
+    return list(sessions.values())[0]["display"]
+
+
+def _screenshot_via_xlib(display, out_path):
+    """Fallback screenshot method using python-xlib + Pillow.
+    Used when ImageMagick 'import' is unavailable."""
+    try:
+        from Xlib.display import Display as XlibDisplay
+        from Xlib import X
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError(f"python-xlib and Pillow are required for screenshot fallback. Install: pip install python-xlib Pillow. Original error: {e}")
+
+    d = XlibDisplay(display)
+    root = d.screen().root
+    geom = root.get_geometry()
+    plane_mask = 0xFFFFFFFF
+    image = root.get_image(0, 0, geom.width, geom.height, X.ZPixmap, plane_mask)
+
+    if image.depth == 24:
+        img = Image.frombytes("RGB", (geom.width, geom.height), image.data, "raw", "BGRX")
+    elif image.depth == 32:
+        img = Image.frombytes("RGBA", (geom.width, geom.height), image.data, "raw", "BGRA")
+    elif image.depth == 16:
+        img = Image.frombytes("RGB", (geom.width, geom.height), image.data, "raw", "BGR;16")
+    else:
+        raise RuntimeError(f"Unsupported X11 depth: {image.depth}")
+
+    img.save(out_path)
+
+
+def cmd_screenshot(args):
+    session_id = args.session
+    out_path = args.out
+
+    # Resolve display
+    display = ":99"
+    if session_id:
+        sess = SessionRegistry.get(session_id)
+        if not sess:
+            print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+        display = sess["display"]
+    else:
+        # Default to first display in registry
+        sessions = SessionRegistry.list_all()
+        if sessions:
+            display = list(sessions.values())[0]["display"]
+
+    if not out_path:
+        out_path = f"/tmp/screenshot_{int(time.time())}.png"
+
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    # Try ImageMagick 'import' first (faster); fall back to python-xlib if unavailable
+    import_bin = shutil.which("import")
+    if import_bin:
+        try:
+            subprocess.run([import_bin, "-window", "root", out_path], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print_json({"status": "ok", "path": out_path})
+            return
+        except subprocess.CalledProcessError as e:
+            debug_log(f"ImageMagick import failed (rc={e.returncode}), falling back to python-xlib")
+        except Exception as e:
+            debug_log(f"ImageMagick import raised {e}, falling back to python-xlib")
+
+    # Fallback: python-xlib + Pillow
+    try:
+        _screenshot_via_xlib(display, out_path)
+    except Exception as e:
+        print_error("SCREENSHOT_FAILED", f"Capture failed (tried 'import' and python-xlib): {e}")
+
+    print_json({"status": "ok", "path": out_path})
+
+
+def cmd_click(args):
+    # Validate bounds
+    x, y = args.x, args.y
+    if x < 0 or x > 1919 or y < 0 or y > 1079:
+        print_error("OUT_OF_BOUNDS", f"Coordinates ({x}, {y}) exceed 1920x1080 display limits")
+
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    try:
+        subprocess.run(["xdotool", "mousemove", str(x), str(y), "click", "1"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print_error("CLICK_FAILED", str(e))
+
+    print_json({"status": "ok"})
+
+
+def cmd_key(args):
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    try:
+        subprocess.run(["xdotool", "key", args.keysym], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print_error("KEY_FAILED", str(e))
+
+    print_json({"status": "ok"})
+
+
+def cmd_type(args):
+    # Enforce ASCII only
+    text = args.text
+    if not text.isascii():
+        print_error("NON_ASCII_TEXT", "CLI typing is limited to ASCII. For Unicode, use clipboard write + Ctrl+V.")
+
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    try:
+        subprocess.run(["xdotool", "type", "--clearmodifiers", text], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print_error("TYPE_FAILED", str(e))
+
+    print_json({"status": "ok"})
+
+
+def _decode_log_bytes(data):
+    """Decode Wine log bytes to text, handling UTF-16 LE output (common for
+    Windows console apps like sigcheck, ipconfig, systeminfo) and the regular
+    UTF-8 case. Auto-detects via BOM or null-byte pattern."""
+    if not data:
+        return ""
+    # Check for UTF-16 LE BOM
+    if data.startswith(b"\xff\xfe"):
+        return data.decode("utf-16-le", errors="replace")[1:]  # strip BOM
+    # Check for UTF-16 BE BOM
+    if data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16-be", errors="replace")[1:]
+    # Heuristic: count null bytes in first 100 bytes — if >30%, it's likely UTF-16 LE
+    # (Windows console apps often emit UTF-16 without BOM)
+    sample = data[:200]
+    null_count = sample.count(b"\x00")
+    if len(sample) > 10 and null_count > len(sample) * 0.25:
+        try:
+            decoded = data.decode("utf-16-le", errors="replace")
+            # Sanity check: if decode produced a lot of replacement chars, fall back
+            if decoded.count("\ufffd") < len(decoded) * 0.1:
+                return decoded
+        except Exception:
+            pass
+    # Default: UTF-8 with fallback
+    return data.decode("utf-8", errors="replace")
+
+
+def cmd_logs(args):
+    session_id = args.session_id
+    lines_count = args.lines
+
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+
+    log_path = sess["log_path"]
+    if not os.path.exists(log_path):
+        print_json({"status": "ok", "logs": ""})
+        return
+
+    try:
+        # Read as binary so we can detect encoding
+        with open(log_path, "rb") as f:
+            data = f.read()
+        logs_text = _decode_log_bytes(data)
+        # Apply line limit on the decoded text
+        if lines_count:
+            lines = logs_text.splitlines(keepends=True)
+            logs_text = "".join(lines[-lines_count:])
+    except Exception as e:
+        print_error("READ_LOGS_FAILED", str(e))
+
+    print_json({"status": "ok", "logs": logs_text})
+
+
+def cmd_kill(args):
+    session_id = args.session_id
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+
+    wineprefix = sess["wineprefix"]
+    pid = sess["pid"]
+
+    # Kill ALL processes with this WINEPREFIX in their environ — robust against
+    # reparented wineserver/winedevice processes that the old killpg approach missed.
+    killed_pids = []
+    for p in get_pids_for_prefix(wineprefix):
+        try:
+            os.kill(p, 9)
+            killed_pids.append(p)
+        except Exception:
+            pass
+
+    # Also try to kill the original process group as a fallback
+    try:
+        os.killpg(os.getpgid(pid), 9)
+    except Exception:
+        pass
+
+    # Scoped wineserver -k (graceful shutdown)
+    env = os.environ.copy()
+    env["WINEPREFIX"] = wineprefix
+    wineserver_bin = f"{get_prefix_dir()}/usr/bin/wineserver"
+    if os.path.exists(wineserver_bin):
+        subprocess.run([wineserver_bin, "-k"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Clean Registry
+    SessionRegistry.unregister(session_id)
+
+    # Delete session cache directory
+    session_work = os.path.dirname(wineprefix)
+    subprocess.run(["rm", "-rf", session_work], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print_json({"status": "ok", "killed_pids": killed_pids})
+
+
+def cmd_list(args):
+    sessions = SessionRegistry.list_all()
+    active_sessions = []
+
+    for sess_id, info in list(sessions.items()):
+        # Check if root PID is still alive
+        pid = info["pid"]
+        alive = os.path.exists(f"/proc/{pid}")
+
+        # Don't auto-delete dead sessions — mark them so the agent can still
+        # inspect logs via 'headless logs <sess_id>' before they're gc'd.
+        # Use 'headless gc' to remove dead sessions explicitly.
+        active_sessions.append({
+            "session_id": sess_id,
+            "pid": pid,
+            "display": info["display"],
+            "wineprefix": info["wineprefix"],
+            "created_at": info["created_at"],
+            "state": "running" if alive else "dead"
+        })
+
+    print_json({"status": "ok", "sessions": active_sessions})
+
+
+def cmd_clipboard(args):
+    display = _resolve_display(args, required_session=False)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    # Retries for async X11 clipboards
+    max_retries = 3
+
+    if args.write is not None:
+        text = args.write
+        for attempt in range(max_retries):
+            try:
+                proc = subprocess.Popen(["xclip", "-selection", "clipboard", "-in"], env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc.communicate(input=text.encode("utf-8"))
+                if proc.returncode == 0:
+                    break
+            except Exception:
+                time.sleep(0.1)
+        print_json({"status": "ok"})
+    else:
+        # Read clipboard
+        clip_text = ""
+        for attempt in range(max_retries):
+            try:
+                res = subprocess.run(["xclip", "-selection", "clipboard", "-out"], env=env, capture_output=True, text=True)
+                if res.returncode == 0:
+                    clip_text = res.stdout
+                    break
+            except Exception:
+                time.sleep(0.1)
+        print_json({"status": "ok", "text": clip_text})
+
+
+def cmd_windows(args):
+    display = _resolve_display(args, required_session=False)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    # Collect all PIDs belonging to all active sessions to map windows
+    sessions = SessionRegistry.list_all()
+    all_pids = []
+    pid_to_session = {}
+    for sess_id, info in sessions.items():
+        wineprefix = info["wineprefix"]
+        prefix_pids = get_pids_for_prefix(wineprefix)
+        for p in prefix_pids:
+            all_pids.append(p)
+            pid_to_session[p] = sess_id
+
+    try:
+        # list visible windows
+        res = subprocess.run(["wmctrl", "-l", "-p"], env=env, capture_output=True, text=True)
+        if res.returncode != 0:
+            print_json({"status": "ok", "windows": []})
+            return
+
+        windows = []
+        for line in res.stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) >= 4:
+                w_id = parts[0]
+                pid = int(parts[2])
+                title = parts[4] if len(parts) > 4 else ""
+
+                # Check modal type using xprop
+                is_modal = False
+                xprop_res = subprocess.run(["xprop", "-id", w_id, "_NET_WM_STATE", "_NET_WM_WINDOW_TYPE"], env=env, capture_output=True, text=True)
+                if xprop_res.returncode == 0:
+                    if "_NET_WM_STATE_ABOVE" in xprop_res.stdout or "_NET_WM_WINDOW_TYPE_DIALOG" in xprop_res.stdout:
+                        is_modal = True
+
+                session_id = pid_to_session.get(pid, "unknown")
+                windows.append({
+                    "id": w_id,
+                    "pid": pid,
+                    "session_id": session_id,
+                    "title": title,
+                    "type": "modal" if is_modal else "normal"
+                })
+        print_json({"status": "ok", "windows": windows})
+    except Exception as e:
+        print_error("WINDOWS_LIST_FAILED", str(e))
+
+
+def cmd_focus(args):
+    session_id = args.session_id
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+
+    display = sess["display"]
+    wineprefix = sess["wineprefix"]
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    pids = get_pids_for_prefix(wineprefix)
+    windows = get_windows_for_session(display, pids)
+    if not windows:
+        print_error("NO_WINDOW_FOUND", f"No open windows found for session {session_id}")
+
+    # Focus the first matching window
+    w_id = windows[0]["id"]
+    try:
+        subprocess.run(["xdotool", "windowactivate", w_id], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print_error("FOCUS_FAILED", str(e))
+
+    print_json({"status": "ok"})
+
+
+def cmd_accept_dialog(args):
+    """Auto-accept a modal dialog (EULA, OK/Cancel prompt, etc.) by pressing
+    Enter on the foreground window. Most Windows modal dialogs have the
+    "Accept"/"OK"/"Yes" button as the default button, so Enter activates it.
+
+    For EULA dialogs that require multiple clicks, run this command multiple
+    times, or use --clicks N to press Enter N times with a delay between.
+
+    This is a best-effort heuristic — for dialogs with non-default button
+    layouts, use 'headless click X Y' to click a specific button by position."""
+    session_id = args.session_id
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+
+    display = sess["display"]
+    wineprefix = sess["wineprefix"]
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    # Find the foreground window
+    pids = get_pids_for_prefix(wineprefix)
+    windows = get_windows_for_session(display, pids)
+    if not windows:
+        print_error("NO_WINDOW_FOUND", f"No open windows found for session {session_id}")
+
+    # Focus the most recent window (usually the modal dialog)
+    w_id = windows[-1]["id"]  # last = most recently created = likely the dialog
+    try:
+        subprocess.run(["xdotool", "windowactivate", w_id], env=env, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+    except Exception as e:
+        print_error("FOCUS_FAILED", f"Failed to focus dialog: {e}")
+
+    clicks = args.clicks or 1
+    delay = args.delay or 0.3
+    accepted_count = 0
+    for i in range(clicks):
+        try:
+            # Press Enter (Return) — activates the default button
+            subprocess.run(["xdotool", "key", "Return"], env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            accepted_count += 1
+            time.sleep(delay)
+        except Exception as e:
+            debug_log(f"accept-dialog: key press {i+1} failed: {e}")
+            break
+
+    print_json({"status": "ok", "pressed_enter_count": accepted_count,
+                "window_id": w_id, "window_title": windows[-1].get("title", "")})
+
+
+def cmd_wait_window(args):
+    session_id = args.session_id
+    timeout_ms = args.timeout or 10000 # default 10s
+    start_time = time.time()
+    
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+
+    display = sess["display"]
+    wineprefix = sess["wineprefix"]
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    last_hash = None
+    stable_start = None
+    
+    while (time.time() - start_time) * 1000 < timeout_ms:
+        pids = get_pids_for_prefix(wineprefix)
+        windows = get_windows_for_session(display, pids)
+        
+        if windows:
+            w_id = windows[0]["id"]
+            # Capture for pixel stability
+            tmp_path = f"/tmp/wait_w_{session_id}.png"
+            try:
+                subprocess.run(["import", "-window", w_id, tmp_path], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with open(tmp_path, "rb") as f:
+                    current_hash = hashlib.md5(f.read()).hexdigest()
+                
+                if current_hash == last_hash:
+                    if not stable_start:
+                        stable_start = time.time()
+                    elif (time.time() - stable_start) >= 0.150: # 150ms stable
+                        # Stable!
+                        elapsed = int((time.time() - start_time) * 1000)
+                        os.remove(tmp_path)
+                        print_json({"status": "ok", "elapsed_ms": elapsed})
+                        return
+                else:
+                    last_hash = current_hash
+                    stable_start = None
+            except Exception:
+                pass
+        else:
+            last_hash = None
+            stable_start = None
+            
+        time.sleep(0.05) # poll every 50ms
+
+    print_json({"status": "timeout"})
+    sys.exit(2) # exit code 2 on timeout
+
+
+# --- Integrated Verification ---
+
+def run_verify(args):
+    """Integrated smoke test: init display → exec dx9_triangle.exe → wait-window
+    → screenshot → kill → analyze colors. Returns exit code 0 on pass, 1 on fail.
+    Each step aborts early with a clear error so the agent doesn't get confusing
+    downstream failures from a missing window."""
+    print("=== HeadlessLab — Smoke Test (Integrated in CLI) ===")
+
+    # 1. Kill old processes
+    pkill_proc = subprocess.Popen(["pkill", "-9", "-f", "wine64.*\\.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pkill_proc.wait()
+    pkill_server = subprocess.Popen(["pkill", "-9", "-f", "wineserver"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pkill_server.wait()
+    time.sleep(1)
+
+    appdir = get_appdir()
+    triangle_exe = os.path.join(appdir, "examples/dx9_triangle.exe")
+    screenshot_path = "/tmp/verify_screenshot.png"
+    if os.path.exists(screenshot_path):
+        os.remove(screenshot_path)
+
+    # 2. Init display via shared helper (no more duplicated Xvfb/Openbox code)
+    print(">> Initializing display...")
+    display = find_free_display()
+    geometry = "1920x1080x24"
+    ok, err = _start_display(display, geometry)
+    if not ok:
+        print(f"[FAIL] Display init failed: {err}")
+        sys.exit(1)
+
+    # 3. Exec triangle
+    print(">> Initializing WINEPREFIX and running example...")
+    exec_args = argparse.Namespace(
+        exe_path=triangle_exe,
+        display=display,
+        args=[]
+    )
+    cmd_exec(exec_args)
+
+    # Wait for session registration
+    time.sleep(1)
+    sessions = SessionRegistry.list_all()
+    if not sessions:
+        print("[FAIL] No session registered after exec. Wine failed to start.")
+        # Clean up display
+        subprocess.run(["pkill", "-9", "-f", f"Xvfb {display}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sys.exit(1)
+    session_id = list(sessions.keys())[-1]  # pick last session
+
+    # 4. Wait window stability — abort cleanly on timeout instead of continuing
+    print(">> Waiting for triangle stability...")
+    wait_args = argparse.Namespace(
+        session_id=session_id,
+        timeout=15000
+    )
+    try:
+        cmd_wait_window(wait_args)
+    except SystemExit as se:
+        if se.code != 0:
+            print(f"[FAIL] Waiting for window timed out (exit code {se.code}).")
+            # Still kill the session and clean up
+            kill_args = argparse.Namespace(session_id=session_id)
+            try:
+                cmd_kill(kill_args)
+            except Exception:
+                pass
+            subprocess.run(["pkill", "-9", "-f", f"Xvfb {display}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-9", "-f", f"openbox.*{display}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sys.exit(1)
+
+    # 5. Screenshot
+    print(">> Capturing screenshot...")
+    screenshot_args = argparse.Namespace(
+        session=session_id,
+        out=screenshot_path
+    )
+    cmd_screenshot(screenshot_args)
+
+    # 6. Kill session
+    print(">> Terminating session...")
+    kill_args = argparse.Namespace(
+        session_id=session_id
+    )
+    cmd_kill(kill_args)
+
+    # Kill Xvfb/Openbox processes of this test run
+    subprocess.run(["pkill", "-9", "-f", f"Xvfb {display}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-9", "-f", f"openbox.*{display}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 7. Analyze
+    print(">> Analyzing rendering...")
+    from PIL import Image
+    try:
+        img = Image.open(screenshot_path)
+        colors = img.getcolors(maxcolors=1024*1024)
+        if not colors:
+            print("[FAIL] No colors found in screenshot.")
+            sys.exit(1)
+        n = len(colors)
+        print(f"Unique colors: {n}")
+        if n > 100:
+            print(f"[OK] Smoke Test PASS! The runtime is working perfectly ({n} colors > 100)!")
+            sys.exit(0)
+        else:
+            print(f"[FAIL] Smoke Test FAIL! Too few colors ({n} <= 100).")
+            sys.exit(1)
+    except Exception as e:
+        print(f"[FAIL] Verify analysis failed: {e}")
+        sys.exit(1)
+
+
+# --- Main CLI Entrypoint ---
+
+def main():
+    parser = argparse.ArgumentParser(description="Headless Wine DX9 CLI Controller")
+    
+    # Global flags
+    parser.add_argument("--verify", action="store_true", help="Runs the integrated smoke test")
+    
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Command: init
+    parser_init = subparsers.add_parser("init", help="Initializes virtual Xvfb server + Window Manager")
+    parser_init.add_argument("--geometry", default="1920x1080x24", help="Virtual display resolution")
+
+    # Command: exec
+    parser_exec = subparsers.add_parser("exec", help="Executes a Windows application (.exe)")
+    parser_exec.add_argument("exe_path", help="Path to the Windows executable")
+    parser_exec.add_argument("--display", help="Specify X11 display to use (e.g. :99)")
+    parser_exec.add_argument("args", nargs=argparse.REMAINDER, help="Extra arguments for the application")
+
+    # Command: screenshot
+    parser_screenshot = subparsers.add_parser("screenshot", help="Takes a screenshot of the virtual display")
+    parser_screenshot.add_argument("--session", help="Specific session to get coordinates from")
+    parser_screenshot.add_argument("--out", help="Output PNG file path")
+
+    # Command: click
+    parser_click = subparsers.add_parser("click", help="Simulates mouse click")
+    parser_click.add_argument("x", type=int, help="X coordinate")
+    parser_click.add_argument("y", type=int, help="Y coordinate")
+    parser_click.add_argument("--session", help="Session ID (required if multiple sessions are active)")
+    parser_click.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+
+    # Command: key
+    parser_key = subparsers.add_parser("key", help="Simulates key press (KeySym)")
+    parser_key.add_argument("keysym", help="Key code (e.g. Return, Escape, Tab)")
+    parser_key.add_argument("--session", help="Session ID (required if multiple sessions are active)")
+    parser_key.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+
+    # Command: type
+    parser_type = subparsers.add_parser("type", help="Simulates ASCII text typing")
+    parser_type.add_argument("text", help="ASCII text to type")
+    parser_type.add_argument("--session", help="Session ID (required if multiple sessions are active)")
+    parser_type.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+
+    # Command: logs
+    parser_logs = subparsers.add_parser("logs", help="Returns session logs")
+    parser_logs.add_argument("session_id", help="Session ID")
+    parser_logs.add_argument("--lines", type=int, help="Number of lines from the tail")
+
+    # Command: kill
+    parser_kill = subparsers.add_parser("kill", help="Terminates session processes and frees resources")
+    parser_kill.add_argument("session_id", help="Session ID")
+
+    # Command: list
+    subparsers.add_parser("list", help="Lists all active sessions")
+
+    # Command: clipboard
+    parser_clip = subparsers.add_parser("clipboard", help="Reads or writes to the X11 clipboard")
+    parser_clip.add_argument("--write", help="Write text to the clipboard")
+    parser_clip.add_argument("--session", help="Session ID (required if multiple sessions are active)")
+    parser_clip.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+
+    # Command: windows
+    parser_windows = subparsers.add_parser("windows", help="Lists all mapped active windows")
+    parser_windows.add_argument("--session", help="Filter windows by session ID")
+    parser_windows.add_argument("--display", help="X11 display (e.g. :99). Alternative to --session.")
+
+    # Command: focus
+    parser_focus = subparsers.add_parser("focus", help="Focuses on the session's window")
+    parser_focus.add_argument("session_id", help="Session ID")
+
+    # Command: accept-dialog (NEW — auto-accept EULA/OK dialogs by pressing Enter)
+    parser_accept = subparsers.add_parser("accept-dialog",
+        help="Auto-accept a modal dialog (EULA, OK/Cancel) by pressing Enter on the default button")
+    parser_accept.add_argument("session_id", help="Session ID")
+    parser_accept.add_argument("--clicks", type=int, default=1,
+        help="Number of times to press Enter (default 1). Use >1 for multi-step wizards.")
+    parser_accept.add_argument("--delay", type=float, default=0.3,
+        help="Delay between Enter presses in seconds (default 0.3)")
+
+    # Command: wait-window
+    parser_wait = subparsers.add_parser("wait-window", help="Waits for window and pixel stability")
+    parser_wait.add_argument("session_id", help="Session ID")
+    parser_wait.add_argument("--timeout", type=int, help="Timeout in ms")
+
+    args = parser.parse_args()
+
+    if args.verify:
+        run_verify(args)
+        return
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    # Command Router
+    command_map = {
+        "init": cmd_init,
+        "exec": cmd_exec,
+        "screenshot": cmd_screenshot,
+        "click": cmd_click,
+        "key": cmd_key,
+        "type": cmd_type,
+        "logs": cmd_logs,
+        "kill": cmd_kill,
+        "list": cmd_list,
+        "clipboard": cmd_clipboard,
+        "windows": cmd_windows,
+        "focus": cmd_focus,
+        "accept-dialog": cmd_accept_dialog,
+        "wait-window": cmd_wait_window
+    }
+
+    try:
+        command_map[args.command](args)
+    except Exception as e:
+        print_error("UNCAUGHT_EXCEPTION", str(e), exit_code=99)
+
+if __name__ == "__main__":
+    main()
