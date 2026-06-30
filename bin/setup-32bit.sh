@@ -141,9 +141,48 @@ ok "Patched wine32 interpreter -> /usr/lib/ld-linux.so.2"
 cp "$PREFIX/lib/ld-linux.so.2" "$PREFIX/usr/lib/ld-linux.so.2"
 ok "ld-linux.so.2 -> $PREFIX/usr/lib/ld-linux.so.2 (for bwrap mount)"
 
-# 4. Verify
+# 4. Compile 32-bit zlib1.dll (required by 32-bit user32.dll and many other DLLs)
+# Debian's libwine:i386 does NOT include zlib1.dll — Wine expects it to be provided.
+# Without it, EVERY 32-bit app fails with "Library zlib1.dll not found" cascading errors.
 echo ""
-echo "=== 4. Verification ==="
+echo "=== 4. Compiling 32-bit zlib1.dll ==="
+ZLIB32_BUILD="$BUNDLE_DIR/_build/zlib32"
+mkdir -p "$ZLIB32_BUILD"
+cd "$ZLIB32_BUILD"
+
+if [ ! -f zlib-1.3.1.tar.gz ]; then
+    curl -sSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz -o zlib.tar.gz
+fi
+tar xzf zlib.tar.gz
+cd zlib-1.3.1
+
+MINGW_CC="i686-w64-mingw32-gcc-win32"
+if ! which "$MINGW_CC" > /dev/null 2>&1; then
+    fail "i686-w64-mingw32-gcc-win32 not found. Install MinGW 32-bit:"
+    fail "  apt-get download binutils-mingw-w64-i686 gcc-mingw-w64-i686-win32 g++-mingw-w64-i686-win32"
+    exit 1
+fi
+
+for src in adler32.c crc32.c deflate.c inflate.c inftrees.c inffast.c zutil.c \
+           trees.c gzclose.c gzlib.c gzread.c gzwrite.c compress.c uncompr.c; do
+    [ -f "$src" ] && "$MINGW_CC" -O2 -DZLIB_DLL -DWINDOWS -c "$src" -o "${src%.c}.o"
+done
+
+"$MINGW_CC" -shared -o zlib1.dll \
+    -Wl,--out-implib,libz.dll.a \
+    adler32.o crc32.o deflate.o inflate.o inftrees.o inffast.o zutil.o trees.o \
+    gzclose.o gzlib.o gzread.o gzwrite.o compress.o uncompr.o
+
+# Copy to the i386-windows directory (where headless creates syswow64 symlinks to)
+cp zlib1.dll "$PREFIX/usr/lib/i386-linux-gnu/wine/i386-windows/zlib1.dll"
+ok "32-bit zlib1.dll compiled and placed in i386-windows/"
+
+cd "$BUNDLE_DIR"
+rm -rf "$ZLIB32_BUILD"
+
+# 5. Verify
+echo ""
+echo "=== 5. Verification ==="
 ls -la "$PREFIX/usr/lib/wine/wine" && ok "wine (32-bit) binary present"
 ls -la "$PREFIX/usr/lib/wine/wineserver32" && ok "wineserver32 present"
 ls "$PREFIX/usr/lib/i386-linux-gnu/wine/i386-windows/" | wc -l | xargs echo "  i386-windows DLLs:"
@@ -151,9 +190,9 @@ ls "$PREFIX/usr/lib/i386-linux-gnu/wine/i386-unix/" 2>/dev/null | wc -l | xargs 
 ls -la "$PREFIX/lib/ld-linux.so.2" && ok "ld-linux.so.2 present"
 ls -la "$PREFIX/usr/lib/ld-linux.so.2" && ok "ld-linux.so.2 (for bwrap) present"
 
-# 5. Cleanup
+# 6. Cleanup
 echo ""
-echo "=== 5. Cleanup ==="
+echo "=== 6. Cleanup ==="
 rm -rf "$WORK_DIR/libc6_extract"
 rm -f "$WORK_DIR/wine32_i386.deb" "$WORK_DIR/libwine_i386.deb" "$WORK_DIR/libc6_i386.deb"
 rmdir "$WORK_DIR" 2>/dev/null || true
