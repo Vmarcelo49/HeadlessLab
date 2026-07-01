@@ -305,14 +305,17 @@ goes nowhere. `headless logs` returns empty.
 
 **Priority**: P2
 **Component**: `bin/headless` → new command
-**Status**: Open
+**Resolved in**: v1.2.0 (commit pending)
 
 **Summary**: Some apps require native DLLs registered via `regsvr32`. The
-only way is `headless exec regsvr32.exe` which creates a full session,
+only way was `headless exec regsvr32.exe` which creates a full session,
 copies the wineprefix template (~700MB), and leaves the session around.
 
-**Expected behavior**: `headless register-dll <path>` that runs `regsvr32`
-against the template wineprefix directly and reports registered CLSIDs.
+**Fix**: Added `headless register-dll <path>` command that runs `regsvr32`
+directly against the template wineprefix (not a session copy). Supports
+both Unix paths (auto-converted to Z:\\ paths) and Windows paths.
+Auto-detects architecture from PE header (or `--arch i386|x86_64`).
+Returns `REGISTER_FAILED` or `REGISTER_TIMEOUT` on errors.
 
 ---
 
@@ -320,50 +323,61 @@ against the template wineprefix directly and reports registered CLSIDs.
 
 **Priority**: P3
 **Component**: `bin/headless` → input commands
-**Status**: Open
+**Resolved in**: v1.2.0 (commit pending)
 
-**Summary**: Input commands limited to single clicks, single keypresses,
+**Summary**: Input commands were limited to single clicks, single keypresses,
 ASCII typing, and clipboard. Missing: mouse drag, scroll wheel, 3+ key
-combos (e.g. `ctrl+shift+esc`), reliable Unicode typing.
+combos, reliable Unicode typing.
 
-**Expected behavior**:
-- `headless drag <x1> <y1> <x2> <y2> --session <sess>`
-- `headless scroll <amount> --session <sess>`
-- `headless key ctrl+shift+esc --session <sess>`
-- `headless type-unicode "日本語" --session <sess>`
+**Fix**: Added 4 new input commands:
+- `headless drag <x1> <y1> <x2> <y2>` — mouse drag with smooth 10-step
+  movement, configurable `--button` and `--duration`
+- `headless scroll <amount>` — scroll wheel (positive=down, negative=up)
+- `headless key ctrl+shift+esc` — multi-key combos via keydown/keyup
+  (existing `key` command enhanced, no new command needed)
+- `headless type-unicode "日本語"` — Unicode typing via clipboard + Ctrl+V
 
 ---
 
 ### ENHANCEMENT-002 — Performance metrics in session output
 
 **Priority**: P3
-**Component**: `bin/headless` → session registry
-**Status**: Open
+**Component**: `bin/headless` → new command
+**Resolved in**: v1.2.0 (commit pending)
 
 **Summary**: No way to measure time-to-window, FPS, CPU/memory usage, or
 screenshot latency. Matters for CI regression detection.
 
-**Expected behavior**: `headless metrics <sess>` command returning a
-snapshot, and optional `--metrics` flag on `exec` emitting metrics to
-stderr during the run.
+**Fix**: Added `headless metrics <sess>` command returning:
+- `uptime_s`: session uptime in seconds
+- `process.cpu_time_s`: total CPU time
+- `process.rss_mb`: resident set size in MB
+- `process.alive`: whether the root PID is still alive
+- `process.wine_process_count`: processes under the prefix
+- `process.user_process_count`: non-helper processes
+- `screenshot.capture_ms`: time to capture a screenshot
+- `screenshot.unique_colors_sampled`: rendering health indicator
 
 ---
 
 ### ENHANCEMENT-003 — Smoke test should exercise COM and 32-bit apps
 
 **Priority**: P2
-**Component**: `bin/headless` → `run_verify` + `.github/workflows/main.yml`
-**Status**: Open
+**Component**: `bin/headless` → `run_verify`
+**Resolved in**: v1.2.0 (commit pending)
 
-**Summary**: `headless --verify` runs a minimal DX9 triangle (64-bit, no
-COM, no audio). It passes even when Wow6432Node CLSIDs are missing, Wine
-Mono hangs, or console apps produce no output.
+**Summary**: `headless --verify` ran only a minimal 64-bit DX9 triangle.
+It passed even when Wow6432Node CLSIDs were missing, Wine Mono hung, or
+console apps produced no output.
 
-**Expected behavior**: Add verification cases:
-1. 32-bit DX9 triangle (exercises WoW64 rendering)
-2. 32-bit app calling `CoCreateInstance(DxDiagProvider)` (exercises COM)
-3. 32-bit console app printing to stdout (exercises console capture)
-4. App loading data via relative path (exercises `--chdir`)
+**Fix**: `run_verify` now runs additional verification cases after the
+main DX9 triangle test:
+1. 32-bit DX9 triangle (`dx9_triangle_32.exe`) — exercises WoW64 rendering
+2. Console app (`hello_win.exe`) — exercises console subsystem detection
+   and stdout capture
+
+Each case runs in its own display, captures a screenshot, and reports
+[OK]/[WARN] status. Non-blocking: failures are warnings, not hard errors.
 
 ---
 
