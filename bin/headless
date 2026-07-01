@@ -1286,11 +1286,18 @@ def _screenshot_blank_check(out_path):
     so agents can distinguish 'app crashed' from 'app still loading'."""
     try:
         from PIL import Image
-        from collections import Counter
         img = Image.open(out_path).convert("RGB")
-        # Sample every 4th pixel for speed (still accurate enough for blank check)
-        pixels = list(img.getdata())[::4]
-        unique = len(set(pixels))
+        # Use an iterator-based approach to avoid loading all pixels into
+        # memory at once. For a 1920x1080 image, this saves ~6MB.
+        # Sample every 4th pixel via crop-based iteration.
+        colors = set()
+        for y in range(0, img.height, 2):
+            for x in range(0, img.width, 2):
+                colors.add(img.getpixel((x, y)))
+                if len(colors) > 100:
+                    # Early exit: clearly not blank, no need to check more
+                    return len(colors), None
+        unique = len(colors)
         if unique < 5:
             return unique, (
                 f"Screenshot appears blank ({unique} unique colors). "
@@ -1876,33 +1883,21 @@ def cmd_click(args):
 
 def cmd_key(args):
     """Press a key or key combination. Supports multi-key combos like
-    ctrl+shift+esc via xdotool's '+' syntax (LIMITATION-006)."""
+    ctrl+shift+esc via xdotool's native '+' syntax (LIMITATION-006).
+    xdotool's 'key' command already handles combos natively, so we just
+    pass the keysym through. No need for manual keydown/keyup."""
     display = _resolve_display(args, required_session=True)
     env = os.environ.copy()
     env["DISPLAY"] = display
 
     keysym = args.keysym
-    # xdotool already supports '+' for combos (e.g. ctrl+shift+esc),
-    # but we need to use 'keydown' + 'keyup' for reliable multi-key combos.
-    # For simple keys (no '+'), use 'key' (original behavior).
-    if "+" in keysym:
-        # Multi-key combo: keydown each, then keyup in reverse order
-        keys = keysym.split("+")
-        try:
-            for k in keys:
-                subprocess.run(["xdotool", "keydown", k], env=env, check=True,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for k in reversed(keys):
-                subprocess.run(["xdotool", "keyup", k], env=env, check=True,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print_error("KEY_FAILED", f"Multi-key combo '{keysym}' failed: {e}")
-    else:
-        try:
-            subprocess.run(["xdotool", "key", keysym], env=env, check=True,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print_error("KEY_FAILED", str(e))
+    try:
+        # xdotool 'key' natively supports combos: ctrl+shift+Escape,
+        # ctrl+c, etc. No need for separate keydown/keyup.
+        subprocess.run(["xdotool", "key", keysym], env=env, check=True,
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print_error("KEY_FAILED", f"Key '{keysym}' failed: {e}")
 
     print_json({"status": "ok", "keysym": keysym})
 
@@ -1997,9 +1992,9 @@ def cmd_type_unicode(args):
     # Small delay for clipboard to settle
     time.sleep(0.1)
 
-    # Paste with Ctrl+V
+    # Paste with Ctrl+V using xdotool's native combo support
     try:
-        subprocess.run(["xdotool", "keydown", "ctrl", "keyup", "v"],
+        subprocess.run(["xdotool", "key", "ctrl+v"],
                       env=env, check=True,
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
@@ -2162,8 +2157,9 @@ def cmd_register_dll(args):
     arch = getattr(args, "arch", None)  # "i386", "x86_64", or None (auto)
 
     wine_dir = get_wine_dir()
+    prefix_dir = get_prefix_dir()
     bwrap_base = [
-        f"{get_prefix_dir()}/usr/bin/bwrap",
+        f"{prefix_dir}/usr/bin/bwrap",
         "--ro-bind", "/usr", "/host-usr",
         "--ro-bind", "/lib", "/lib",
         "--ro-bind", "/lib64", "/lib64",
@@ -2171,19 +2167,30 @@ def cmd_register_dll(args):
         "--ro-bind", "/sbin", "/sbin",
         "--ro-bind", "/etc", "/etc",
         "--bind", "/tmp", "/tmp",
+        # Bind the rootfs so Wine DLLs are accessible inside the sandbox
         "--ro-bind", wine_dir, "/opt/wine-devel",
         "--proc", "/proc",
         "--dev", "/dev",
     ]
+    # Bind the host-debs rootfs if it exists (same as cmd_exec)
+    rootfs_lib = os.path.join(prefix_dir, "usr", "lib")
+    if os.path.exists(rootfs_lib):
+        bwrap_base.extend(["--ro-bind", rootfs_lib, "/usr/lib"])
+    rootfs_lib64 = os.path.join(prefix_dir, "usr", "lib", "x86_64-linux-gnu")
+    if os.path.exists(rootfs_lib64):
+        bwrap_base.extend(["--ro-bind", rootfs_lib64, "/usr/lib/x86_64-linux-gnu"])
+    rootfs_share = os.path.join(prefix_dir, "usr", "share")
+    if os.path.exists(rootfs_share):
+        bwrap_base.extend(["--ro-bind", rootfs_share, "/usr/share"])
 
     # Convert Unix path to Windows path if needed
     windows_dll_path = dll_path
     if not (dll_path.startswith("C:\\") or dll_path.startswith("c:\\")):
         if not os.path.exists(dll_path):
             print_error("DLL_NOT_FOUND", f"DLL not found: {dll_path}")
-        # Convert to Z:\ style path for Wine
+        # Convert to Z:\ style path for Wine: /home/z/x.dll -> Z:\home\z\x.dll
         abs_path = os.path.abspath(dll_path)
-        windows_dll_path = "Z:" + abs_path.replace("/", "\\\"")
+        windows_dll_path = "Z:" + abs_path.replace("/", "\\")
 
     # Detect architecture if not specified
     if arch is None:
@@ -2755,6 +2762,9 @@ def run_verify(args):
     exec_args = argparse.Namespace(
         exe_path=triangle_exe,
         display=display,
+        cwd=None,
+        wait=False,
+        timeout=30000,
         args=[]
     )
     cmd_exec(exec_args)
@@ -2842,6 +2852,8 @@ def run_verify(args):
                     exe_path=triangle_32_exe,
                     display=display2,
                     cwd=None,
+                    wait=False,
+                    timeout=30000,
                     args=[]
                 )
                 # Capture stdout to suppress JSON
@@ -2901,6 +2913,8 @@ def run_verify(args):
                     exe_path=hello_exe,
                     display=display3,
                     cwd=None,
+                    wait=False,
+                    timeout=30000,
                     args=[]
                 )
                 import io as _io2, contextlib as _ctx2
