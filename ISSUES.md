@@ -93,11 +93,26 @@ Also validated that working apps (zzcaster.exe, MBAA.exe) still return
 
 ---
 
-## BUG-002 — `headless wait-window` cannot distinguish "still loading" from "crashed"
+
+### Status
+
+**Fixed** in v1.1.0. `cmd_wait_window` now checks process liveness on each iteration. If no wine processes are under the prefix, or if the log shows a crash marker and only helper PIDs remain, it returns `PROCESS_DIED` immediately instead of waiting the full timeout. The session is marked `state: "crashed"` in the registry. Reuses the module-level `live_user_pids()` and `log_shows_crash()` helpers introduced in the BUG-001 fix.
+
+---
+
+
+### Status
+
+**Fixed** in v1.1.0. Default `WINEDEBUG` changed from `-all,+debugstr` to `warn+heap,err+all`. This captures warnings, errors, and heap diagnostics — enough to diagnose most failures without producing gigabytes of trace output. The `HEADLESS_WINEDEBUG` env var still overrides the default. Documented in `docs/GUIDE_LLM.md`.
+
+---
+
+## BUG-004 — `headless wait-window` cannot distinguish "still loading" from "crashed"
 
 **Priority**: P0
 **Component**: `bin/headless` → `cmd_wait_window`
 **Affected versions**: v1.0.0
+**Resolved in**: v1.1.0 (commit pending)
 
 ### Summary
 
@@ -137,6 +152,7 @@ return `PROCESS_DIED` instead of continuing to poll.
 **Priority**: P0
 **Component**: `bin/headless` → `cmd_exec` (WINEDEBUG setting)
 **Affected versions**: v1.0.0
+**Resolved in**: v1.1.0 (commit pending)
 
 ### Summary
 
@@ -274,11 +290,19 @@ in a future AppImage variant for apps that genuinely need .NET/HTML rendering.
 
 ---
 
-## BUG-006 — `headless screenshot` returns success for blank/black captures
+
+### Status
+
+**Fixed** in v1.1.0. `cmd_screenshot` now analyzes the captured PNG with Pillow (sampling every 4th pixel for speed) and counts unique colors. If fewer than 5, the JSON response includes a `warning` field. The `unique_colors` count is always included so agents can make their own threshold decisions.
+
+---
+
+## BUG-007 — `headless screenshot` returns success for blank/black captures
 
 **Priority**: P1
 **Component**: `bin/headless` → `cmd_screenshot`
 **Affected versions**: v1.0.0
+**Resolved in**: v1.1.0 (commit pending)
 
 ### Summary
 
@@ -363,11 +387,19 @@ for win in all_windows:
 
 ---
 
-## BUG-008 — `headless kill` leaves orphaned debugger/crash-handler processes
+
+### Status
+
+**Fixed** in v1.1.0. `cmd_kill` now sweeps all PIDs from 1 to 65536 for `winedbg`, `crashdump`, and `crashhandler` in their cmdline, killing any that also reference the session's wineprefix path. This catches orphaned debugger processes that survive the standard kill.
+
+---
+
+## LIMITATION-001 — `headless kill` leaves orphaned debugger/crash-handler processes
 
 **Priority**: P1
 **Component**: `bin/headless` → `cmd_kill`
 **Affected versions**: v1.0.0
+**Resolved in**: v1.1.0 (commit pending)
 
 ### Summary
 
@@ -738,11 +770,19 @@ significant time.
 
 ---
 
-## DOCS-002 — No documentation of `HEADLESS_*` environment variables
+
+### Status
+
+**Fixed** in v1.1.0. Added a comprehensive "Environment Variables" section to `docs/GUIDE_LLM.md` documenting all 7 `HEADLESS_*` and `APPDIR` variables with defaults, purpose, and examples.
+
+---
+
+## Release Planning Suggestions — No documentation of `HEADLESS_*` environment variables
 
 **Priority**: P2
 **Component**: `docs/GUIDE_LLM.md`, `README.md`
 **Affected versions**: v1.0.0
+**Resolved in**: v1.1.0 (commit pending)
 
 ### Summary
 

@@ -373,6 +373,105 @@ n = len(colors) if colors else 0
 
 ---
 
+## 🔧 Environment Variables
+
+The `headless` CLI honors the following environment variables. Set them before
+invoking `headless exec` (or any other command) to customize behavior.
+
+### `HEADLESS_WINEDEBUG`
+**Default**: `warn+heap,err+all`
+**Purpose**: Override Wine's debug channel configuration. The default captures
+warnings, errors, and heap diagnostics without producing gigabytes of trace
+output. Use this to enable verbose tracing for debugging.
+
+**Examples**:
+```bash
+# Full relay trace (huge output, use only for deep debugging)
+HEADLESS_WINEDEBUG="+relay" headless exec app.exe
+
+# Focus on DirectX 9 and COM (OLE)
+HEADLESS_WINEDEBUG="+d3d9,+ole" headless exec app.exe
+
+# Disable all Wine debug output (fastest, but hides errors)
+HEADLESS_WINEDEBUG="-all" headless exec app.exe
+```
+
+### `HEADLESS_EXEC_WAIT`
+**Default**: `5` (seconds)
+**Purpose**: How long `headless exec` polls for the Wine process to stabilize
+before returning. If the process crashes within this window, `exec` returns
+`PROCESS_DIED` with the log tail instead of a false `ok`.
+
+**Example**:
+```bash
+# Wait up to 10s for slow-loading apps
+HEADLESS_EXEC_WAIT=10 headless exec slow_app.exe
+```
+
+### `HEADLESS_EXEC_GRACE`
+**Default**: `1.5` (seconds)
+**Purpose**: Grace period after first detecting a live user PID. Wine keeps
+crashed EXE processes alive briefly while `winedbg --auto` attaches, so a
+live PID doesn't immediately mean "running". The CLI polls the log for crash
+markers during this grace period before declaring success.
+
+**Example**:
+```bash
+# Longer grace for apps that crash late
+HEADLESS_EXEC_GRACE=3 headless exec app.exe
+```
+
+### `HEADLESS_DLL_OVERRIDES`
+**Default**: *(unset)*
+**Purpose**: Set Wine DLL overrides (equivalent to `WINEDLLOVERRIDES`).
+Semicolon-separated list of `dll=mode` entries. Useful when the game ships
+native DLLs that should override Wine's builtin versions.
+
+**Example**:
+```bash
+# Use native d3dx9 DLLs from the game directory
+HEADLESS_DLL_OVERRIDES="d3dx9_36=native,builtin;d3dx9_43=native,builtin" \
+    headless exec app.exe
+```
+
+### `HEADLESS_USE_WINECONSOLE`
+**Default**: *(unset)*
+**Purpose**: Force `wineconsole --backend=user` for console-subsystem apps.
+By default, console apps are launched with plain `wine` (their stdout/stderr
+is captured to the log file). Set to `1` to get a visible Wine console window
+(useful for interactive console apps).
+
+**Example**:
+```bash
+HEADLESS_USE_WINECONSOLE=1 headless exec console_app.exe
+```
+
+### `HEADLESS_NO_WAIT_WARNING`
+**Default**: *(unset)*
+**Purpose**: Suppress the one-time-per-session stderr warning that
+`headless screenshot` emits reminding that processes may take time to render.
+
+**Example**:
+```bash
+HEADLESS_NO_WAIT_WARNING=1 headless screenshot --session sess_xxx --out /tmp/x.png
+```
+
+### `APPDIR`
+**Default**: *(auto-detected)*
+**Purpose**: Required when running from an extracted AppImage (FUSE-less
+environments like Docker/CI). Set to the path of the `squashfs-root/`
+directory created by `./HeadlessLab.AppImage --appimage-extract`.
+
+**Example**:
+```bash
+./HeadlessLab.AppImage --appimage-extract
+cd squashfs-root
+export APPDIR="$PWD"
+./AppRun exec /path/to/app.exe
+```
+
+---
+
 ## 📊 Post-Execution Analysis
 
 ### Checking if rendering occurred
