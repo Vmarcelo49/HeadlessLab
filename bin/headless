@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 CACHE_DIR = os.path.expanduser("~/.cache/headlesslab")
 REGISTRY_PATH = os.path.join(CACHE_DIR, "registry.json")
 DEBUG_LOG_PATH = os.path.join(CACHE_DIR, "debug.log")
+WINEPREFIX_TEMPLATE = os.path.join(CACHE_DIR, "wineprefix_template")
 
 def iso_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -350,14 +351,22 @@ def cmd_exec(args):
     session_id = f"sess_{int(time.time())}"
     display = args.display
     
-    # If no display provided, look if there is an active session's display or fallback to default
+    # If no display provided, find the first RUNNING session's display.
+    # Dead sessions may have stale display numbers — skip them.
     if not display:
         sessions = SessionRegistry.list_all()
-        if sessions:
-            # pick the display of the first active session
-            display = list(sessions.values())[0]["display"]
-        else:
-            display = ":99"
+        for info in sessions.values():
+            if os.path.exists(f"/proc/{info['pid']}"):
+                display = info["display"]
+                break
+        if not display:
+            # No running sessions — find any active Xvfb display
+            for i in range(99, 200):
+                if os.path.exists(f"/tmp/.X11-unix/X{i}"):
+                    display = f":{i}"
+                    break
+            if not display:
+                display = ":99"
 
     # Setup per-session writable directories
     session_work = os.path.join(CACHE_DIR, session_id)
@@ -404,86 +413,83 @@ def cmd_exec(args):
     env["WINEDEBUG"] = "-all"
     env["PATH"] = "/opt/wine-devel/bin:/usr/bin:/bin"
 
-    # Run wineboot if registry not created
-    if not os.path.exists(os.path.join(wineprefix, "drive_c/windows/system32/user32.dll")):
-        os.makedirs(wineprefix, exist_ok=True)
+    # Initialize wineprefix — use a template approach for speed and reliability.
+    # Wine 11's wineboot hangs in bwrap (takes 30s+ and often doesn't complete).
+    # Instead, we create a template wineprefix ONCE (first run), then copy it
+    # for each session. This is ~10x faster and avoids the wineboot hang.
+    wine_dir = get_wine_dir()
+    if not os.path.lexists(os.path.join(wineprefix, "drive_c/windows/system32/user32.dll")):
         try:
-            # Wine 11 wineboot hangs in bwrap before creating syswow64.
-            # Run it in background with setsid, poll for user.reg, then kill.
-            wb_proc = subprocess.Popen(
-                bwrap_base + ["/opt/wine-devel/bin/wine", "wineboot.exe", "-u"],
-                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
-            )
-            for _ in range(40):
-                time.sleep(1)
-                if os.path.exists(os.path.join(wineprefix, "user.reg")):
-                    break
-                if wb_proc.poll() is not None:
-                    break
-            # Kill the wineboot process group (including wineserver).
-            # Wine 11's wineserver gets into an inconsistent state if left
-            # running after wineboot is interrupted. Killing it and letting
-            # the exe start a fresh wineserver is the reliable approach.
-            try:
-                os.killpg(os.getpgid(wb_proc.pid), 9)
-            except Exception:
-                pass
-            wb_proc.wait()
-            # Wait for wineserver to fully exit before starting the exe
-            time.sleep(2)
+            # Check if template exists; if not, create it
+            if not os.path.lexists(os.path.join(WINEPREFIX_TEMPLATE, "drive_c/windows/system32/user32.dll")):
+                debug_log("Creating wineprefix template (first run, ~40s)")
+                os.makedirs(WINEPREFIX_TEMPLATE, exist_ok=True)
+                template_env = env.copy()
+                template_env["WINEPREFIX"] = WINEPREFIX_TEMPLATE
 
-            user32_path = os.path.join(wineprefix, "drive_c/windows/system32/user32.dll")
-            if not os.path.exists(user32_path):
-                print_error("WINEBOOT_FAILED", "wineboot.exe -u failed to create system32/user32.dll")
+                # Build a special bwrap_base for template creation that binds
+                # WINEPREFIX_TEMPLATE (since bwrap_base binds session_work,
+                # which doesn't contain the template path)
+                template_bwrap = list(bwrap_base)
+                # Add WINEPREFIX_TEMPLATE as a writable bind
+                template_bwrap.extend(["--bind", WINEPREFIX_TEMPLATE, WINEPREFIX_TEMPLATE])
 
-            # Copy zlib1.dll (Wine 11 from WineHQ doesn't bundle it)
-            wine_dir = get_wine_dir()
-            subprocess.run(["cp", f"{wine_dir}/lib/wine/x86_64-windows/zlib1.dll", f"{wineprefix}/drive_c/windows/system32/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-            # Set graphics driver to x11
-            reg_proc = subprocess.Popen(
-                bwrap_base + ["/opt/wine-devel/bin/wine", "reg", "add", "HKCU\\Software\\Wine\\Drivers", "/v", "Graphics", "/d", "x11", "/f"],
-                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
-            )
-            try:
-                reg_proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
+                # Run wineboot in background with setsid, poll for user.reg
+                wb_proc = subprocess.Popen(
+                    template_bwrap + ["/opt/wine-devel/bin/wine", "wineboot.exe", "-u"],
+                    env=template_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    preexec_fn=os.setsid
+                )
+                for _ in range(45):
+                    time.sleep(1)
+                    if os.path.exists(os.path.join(WINEPREFIX_TEMPLATE, "user.reg")):
+                        break
+                    if wb_proc.poll() is not None:
+                        break
+                # Kill wineboot process group (including wineserver)
                 try:
-                    os.killpg(os.getpgid(reg_proc.pid), 9)
+                    os.killpg(os.getpgid(wb_proc.pid), 9)
                 except Exception:
                     pass
-                reg_proc.wait()
+                wb_proc.wait()
+                time.sleep(2)
 
-            # Symlink duplicate dlls to save space
-            sys32 = f"{wineprefix}/drive_c/windows/system32"
-            src_dir = f"{wine_dir}/lib/wine/x86_64-windows"
-            for f in os.listdir(sys32):
-                fp = os.path.join(sys32, f)
-                if os.path.isfile(fp) and f != "zlib1.dll":
-                    if os.path.exists(os.path.join(src_dir, f)):
-                        os.remove(fp)
-                        os.symlink(f"/opt/wine-devel/lib/wine/x86_64-windows/{f}", fp)
+                user32_path = os.path.join(WINEPREFIX_TEMPLATE, "drive_c/windows/system32/user32.dll")
+                if not os.path.exists(user32_path):
+                    print_error("WINEBOOT_FAILED", "wineboot.exe -u failed to create system32/user32.dll in template")
 
-            # Wine 11 wineboot doesn't populate syswow64/ (known issue in bwrap).
-            # Manually create symlinks to i386-windows/ PE DLLs.
-            # Wine 11's new WoW64 (PE-only) uses these to run 32-bit apps
-            # WITHOUT needing 32-bit ELF wine binary or i386-unix .so files.
-            i386_src = f"{wine_dir}/lib/wine/i386-windows"
-            if os.path.isdir(i386_src):
-                syswow = f"{wineprefix}/drive_c/windows/syswow64"
-                os.makedirs(syswow, exist_ok=True)
-                populated = 0
-                for f in os.listdir(i386_src):
-                    fp = os.path.join(syswow, f)
-                    if not os.path.lexists(fp):
-                        try:
-                            os.symlink(f"/opt/wine-devel/lib/wine/i386-windows/{f}", fp)
-                            populated += 1
-                        except Exception:
-                            pass
-                debug_log(f"Populated syswow64/ with {populated} i386 DLL symlinks")
+                # Copy zlib1.dll (Wine 11 from WineHQ doesn't bundle it)
+                subprocess.run(["cp", f"{wine_dir}/lib/wine/x86_64-windows/zlib1.dll",
+                    f"{WINEPREFIX_TEMPLATE}/drive_c/windows/system32/"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+                # Symlink duplicate dlls to save space
+                sys32 = f"{WINEPREFIX_TEMPLATE}/drive_c/windows/system32"
+                src_dir = f"{wine_dir}/lib/wine/x86_64-windows"
+                for f in os.listdir(sys32):
+                    fp = os.path.join(sys32, f)
+                    if os.path.isfile(fp) and f != "zlib1.dll":
+                        if os.path.exists(os.path.join(src_dir, f)):
+                            os.remove(fp)
+                            os.symlink(f"/opt/wine-devel/lib/wine/x86_64-windows/{f}", fp)
+
+                # Populate syswow64 with i386-windows DLL symlinks
+                i386_src = f"{wine_dir}/lib/wine/i386-windows"
+                if os.path.isdir(i386_src):
+                    syswow = f"{WINEPREFIX_TEMPLATE}/drive_c/windows/syswow64"
+                    os.makedirs(syswow, exist_ok=True)
+                    for f in os.listdir(i386_src):
+                        fp = os.path.join(syswow, f)
+                        if not os.path.lexists(fp):
+                            try:
+                                os.symlink(f"/opt/wine-devel/lib/wine/i386-windows/{f}", fp)
+                            except Exception:
+                                pass
+                debug_log(f"Wineprefix template created at {WINEPREFIX_TEMPLATE}")
+
+            # Copy template to session wineprefix (fast — just a directory copy)
+            debug_log(f"Copying wineprefix template to {wineprefix}")
+            shutil.copytree(WINEPREFIX_TEMPLATE, wineprefix, symlinks=True)
         except Exception as e:
             print_error("WINEBOOT_FAILED", f"Failed to initialize Wine prefix: {e}")
 

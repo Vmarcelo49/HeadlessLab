@@ -106,7 +106,7 @@ if [ "$MODE" = "check" ] && [ $ALL_OK = 0 ]; then
 fi
 
 # === 1.5. Download and extract the bundle (AppImage) if necessary ===
-if [ "$MODE" = "download" ] || [ ! -d "$PREFIX/usr/lib/wine" ]; then
+if [ "$MODE" = "download" ] || [ ! -d "$PREFIX/opt/wine-devel" ]; then
     echo ""
     echo "=== 1.5. Downloading/Extracting AppImage bundle ==="
     
@@ -164,7 +164,7 @@ fi
 echo ""
 echo "=== 1.8. Checking prefix structure ==="
 BUNDLE_OK=1
-for d in prefix/usr/bin/bwrap prefix/usr/lib/wine/wine64 prefix/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/zlib1.dll; do
+for d in prefix/usr/bin/bwrap prefix/opt/wine-devel/bin/wine prefix/opt/wine-devel/lib/wine/x86_64-windows/zlib1.dll; do
     if [ -e "$BUNDLE_DIR/$d" ]; then
         ok "bundle: $d"
     else
