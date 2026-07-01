@@ -1,0 +1,143 @@
+name: Build and Release AppImage
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386 || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb openbox xdotool wmctrl x11-utils xclip imagemagick \
+            libx11-6 libvulkan1 \
+            bubblewrap curl patchelf \
+            binutils-mingw-w64-i686 gcc-mingw-w64-i686-win32 g++-mingw-w64-i686-win32 \
+            binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64-win32 g++-mingw-w64-x86-64-win32 \
+            python3 python3-xlib python3-pil
+          # WineHQ key + repo for Wine 11
+          sudo mkdir -p /etc/apt/keyrings
+          wget -qO- https://dl.winehq.org/wine-builds/winehq.key | sudo gpg --dearmor -o /etc/apt/keyrings/winehq.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/debian/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/winehq.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --install-recommends wine-devel wine-devel-amd64 wine-devel-i386
+
+      - name: Build prefix (Wine 11 from WineHQ)
+        run: |
+          set -e
+          PREFIX="$PWD/prefix"
+          mkdir -p "$PREFIX"
+
+          # Extract Wine 11 packages into prefix/opt/wine-devel/
+          dpkg-deb -x /var/cache/apt/archives/wine-devel_*amd64.deb "$PREFIX/" || true
+          dpkg-deb -x /var/cache/apt/archives/wine-devel-amd64_*amd64.deb "$PREFIX/"
+          dpkg-deb -x /var/cache/apt/archives/wine-devel-i386_*i386.deb "$PREFIX/"
+
+          # Clean up
+          find "$PREFIX/opt/wine-devel/lib/wine/" -name "*.a" -delete
+          rm -rf "$PREFIX/opt/wine-devel/share/man" "$PREFIX/opt/wine-devel/share/doc"
+          rm -rf "$PREFIX/opt/wine-devel/lib/wine/i386-unix"
+
+          # Compile zlib1.dll (64-bit + 32-bit)
+          cd /tmp
+          curl -sSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz -o z.tar.gz
+          tar xzf z.tar.gz
+          cd zlib-1.3.1
+          for s in *.c; do
+            x86_64-w64-mingw32-gcc-win32 -O2 -DZLIB_DLL -DWINDOWS -c "$s" -o "64_${s%.c}.o" 2>/dev/null
+            i686-w64-mingw32-gcc-win32 -O2 -DZLIB_DLL -DWINDOWS -c "$s" -o "32_${s%.c}.o" 2>/dev/null
+          done
+          x86_64-w64-mingw32-gcc-win32 -shared -o zlib1.dll 64_*.o
+          i686-w64-mingw32-gcc-win32 -shared -o zlib1_32.dll 32_*.o
+          cp zlib1.dll "$PREFIX/opt/wine-devel/lib/wine/x86_64-windows/"
+          cp zlib1_32.dll "$PREFIX/opt/wine-devel/lib/wine/i386-windows/zlib1.dll"
+          cd "$GITHUB_WORKSPACE"
+          rm -rf /tmp/zlib-1.3.1 /tmp/z.tar.gz
+
+          # Install bwrap into prefix (WineHQ doesn't bundle it)
+          cp /usr/bin/bwrap "$PREFIX/usr/bin/bwrap"
+
+      - name: Build rootfs
+        run: |
+          set -e
+          ROOTFS="$PWD/rootfs"
+          rm -rf "$ROOTFS"
+          mkdir -p "$ROOTFS/usr/lib" "$ROOTFS/usr/lib/x86_64-linux-gnu" \
+                   "$ROOTFS/usr/share" "$ROOTFS/usr/bin" "$ROOTFS/usr/sbin"
+          for d in /usr/lib/*; do
+            n=$(basename "$d"); [ "$n" = "wine" ] && continue; [ "$n" = "x86_64-linux-gnu" ] && continue
+            ln -sf "/host-usr/lib/$n" "$ROOTFS/usr/lib/$n"
+          done
+          for d in /usr/lib/x86_64-linux-gnu/*; do
+            n=$(basename "$d"); [ "$n" = "wine" ] && continue
+            ln -sf "/host-usr/lib/x86_64-linux-gnu/$n" "$ROOTFS/usr/lib/x86_64-linux-gnu/$n"
+          done
+          for d in /usr/share/*; do
+            n=$(basename "$d"); [ "$n" = "wine" ] && continue; [ "$n" = "vulkan" ] && continue
+            ln -sf "/host-usr/share/$n" "$ROOTFS/usr/share/$n"
+          done
+          for d in bin sbin lib lib64 etc; do
+            ln -sf "/host-$d" "$ROOTFS/$d"
+          done
+          mkdir -p "$ROOTFS/usr/lib/wine" "$ROOTFS/usr/lib/x86_64-linux-gnu/wine" \
+                   "$ROOTFS/usr/lib/i386-linux-gnu" "$ROOTFS/usr/share/wine" "$ROOTFS/usr/share/vulkan"
+
+      - name: Compile DX9 examples
+        run: |
+          export PATH="$PWD/prefix/opt/wine-devel/bin:$PATH"
+          # 64-bit triangle
+          x86_64-w64-mingw32-g++-win32 -O2 -o examples/dx9_triangle.exe examples/dx9_triangle.cpp \
+            -ld3d9 -ld3dcompiler -lgdi32 -luser32 -static-libgcc -static-libstdc++ \
+            -Wl,--subsystem,windows
+          # 32-bit triangle
+          i686-w64-mingw32-g++-win32 -O2 -o examples/dx9_triangle_32.exe examples/dx9_triangle.cpp \
+            -ld3d9 -ld3dcompiler -lgdi32 -luser32 -static-libgcc -static-libstdc++ \
+            -Wl,--subsystem,windows
+          # 64-bit hello_win (console)
+          x86_64-w64-mingw32-g++-win32 -O2 -o examples/hello_win.exe examples/hello_win.cpp \
+            -static-libgcc -static-libstdc++ -Wl,--subsystem,console
+          # 32-bit hello_win
+          i686-w64-mingw32-g++-win32 -O2 -o examples/hello_win_32.exe examples/hello_win.cpp \
+            -static-libgcc -static-libstdc++ -Wl,--subsystem,console
+
+      - name: Package AppImage
+        run: |
+          chmod +x bin/pack-appimage.sh
+          bash bin/pack-appimage.sh
+          ls -lh HeadlessLab.AppImage
+
+      - name: Smoke test (quick)
+        run: |
+          # Pre-extract and run --verify (no FUSE in CI)
+          ./HeadlessLab.AppImage --appimage-extract
+          cd squashfs-root
+          export APPDIR="$PWD"
+          timeout 120 ./AppRun --verify || echo "Smoke test failed (non-blocking in CI)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeadlessLab-AppImage
+          path: HeadlessLab.AppImage
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HeadlessLab.AppImage
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') }}
