@@ -36,7 +36,7 @@ source ~/.local/share/headlesslab/env.sh
 ### Step 2 — Download the AppImage
 
 ```bash
-# Download the latest release (~253MB)
+# Download the latest release (~500MB)
 curl -sSL -o HeadlessLab.AppImage \
   https://github.com/Vmarcelo49/HeadlessLab/releases/latest/download/HeadlessLab.AppImage
 chmod +x HeadlessLab.AppImage
