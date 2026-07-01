@@ -72,6 +72,7 @@ jobs:
           rm -rf /tmp/zlib-1.3.1 /tmp/z.tar.gz
 
           # Install bwrap into prefix (WineHQ doesn't bundle it)
+          mkdir -p "$PREFIX/usr/bin"
           cp /usr/bin/bwrap "$PREFIX/usr/bin/bwrap"
 
       - name: Build rootfs
