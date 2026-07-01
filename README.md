@@ -64,8 +64,9 @@ export APPDIR="$PWD"
 ./AppRun --verify
 ./AppRun init
 ./AppRun exec /path/to/app.exe
+# then you can safely delete the appimage to save space, since you are not going to need it
 ```
-delete the AppImage to save space.
+
 
 ### Step 4 — Run your own Windows app
 
