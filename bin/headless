@@ -133,6 +133,102 @@ def detect_pe_arch(exe_path):
         return "unknown"
 
 
+def mirror_clsids_to_wow64(wineprefix_template, wine_dir):
+    """Mirror ALL COM CLSIDs from the 64-bit registry view to the 32-bit
+    (Wow6432Node) view, and create missing DLL symlinks in syswow64/.
+
+    Wine 11's PE-only WoW64 doesn't automatically reflect CLSID registry
+    entries between 32-bit and 64-bit views. Many 32-bit Windows games use
+    KEY_WOW64_32KEY when calling CoCreateInstance, which looks in
+    HKLM\\Software\\Classes\\Wow6432Node\\CLSID\\... If the CLSID is only in
+    the 64-bit view, CoCreateInstance returns REGDB_E_CLASSNOTREG and the
+    game crashes (many games don't check the return value).
+
+    This function reads system.reg, finds all CLSID InprocServer32 entries,
+    and adds Wow6432Node copies with system32 paths converted to syswow64.
+    Also creates missing DLL symlinks in syswow64/ subdirectories (wbem/,
+    ADO/, OLE DB/, etc.) so the 32-bit DLLs can be loaded.
+
+    This replicates what Wine's old WoW64 (with unix libs) did automatically
+    via registry reflection, and what winetricks achieves by running
+    regsvr32 on each DirectX DLL.
+    """
+    import re as _re
+    system_reg = os.path.join(wineprefix_template, "system.reg")
+    if not os.path.exists(system_reg):
+        return
+
+    with open(system_reg, "r", errors="replace") as f:
+        content = f.read()
+
+    syswow64 = os.path.join(wineprefix_template, "drive_c", "windows", "syswow64")
+    i386_src = os.path.join(wine_dir, "lib", "wine", "i386-windows")
+
+    # Find all CLSID InprocServer32 entries (64-bit view)
+    inproc_pattern = _re.compile(
+        r'\[Software\\\\Classes\\\\CLSID\\\\(\{[0-9A-Fa-f-]+\})\\\\InprocServer32\][^\n]*\n'
+        r'(?:#[^\n]*\n)*'
+        r'@="([^"]*)"\n'
+        r'(?:#[^\n]*\n)*'
+        r'"ThreadingModel"="([^"]*)"'
+    )
+    name_pattern = _re.compile(
+        r'\[Software\\\\Classes\\\\CLSID\\\\(\{[0-9A-Fa-f-]+\})\][^\n]*\n'
+        r'(?:#[^\n]*\n)*'
+        r'@="([^"]*)"'
+    )
+    names = dict(name_pattern.findall(content))
+    inprocs = inproc_pattern.findall(content)
+
+    to_add = []
+    for guid, dll_path, threading in inprocs:
+        if f"Wow6432Node\\\\CLSID\\\\{guid}" in content:
+            continue
+        dll_32 = dll_path.replace("system32", "syswow64")
+        name = names.get(guid, "Unknown")
+        to_add.append((guid, name, dll_32, threading))
+
+    if not to_add:
+        return
+
+    # Create missing DLL symlinks in syswow64/ subdirectories
+    for guid, name, dll_32, threading in to_add:
+        parts = dll_32.replace("\\\\", "\\").split("\\")
+        filename = parts[-1]
+        subdir = ""
+        if len(parts) > 2 and parts[-2] not in ["syswow64", "system32"]:
+            subdir = parts[-2]
+        if subdir:
+            dll_file = os.path.join(syswow64, subdir, filename)
+        else:
+            dll_file = os.path.join(syswow64, filename)
+        if not os.path.lexists(dll_file):
+            wine_dll = os.path.join(i386_src, filename)
+            if os.path.exists(wine_dll):
+                target_dir = os.path.dirname(dll_file)
+                os.makedirs(target_dir, exist_ok=True)
+                try:
+                    os.symlink(wine_dll, dll_file)
+                except Exception:
+                    pass
+
+    # Append Wow6432Node entries to system.reg
+    timestamp = int(time.time())
+    entries = []
+    for guid, name, dll_32, threading in to_add:
+        entries.append(
+            f"\n[Software\\\\Classes\\\\Wow6432Node\\\\CLSID\\\\{guid}] {timestamp}\n"
+            f"#time=1dd09060dd935e6\n"
+            f'@="{name}"\n'
+            f"\n[Software\\\\Classes\\\\Wow6432Node\\\\CLSID\\\\{guid}\\\\InprocServer32] {timestamp}\n"
+            f"#time=1dd09060dd935e6\n"
+            f'@="{dll_32}"\n'
+            f'"ThreadingModel"="{threading}"\n'
+        )
+    new_content = content + "".join(entries)
+    with open(system_reg, "w") as f:
+        f.write(new_content)
+    debug_log(f"Mirrored {len(to_add)} CLSIDs to Wow6432Node in {system_reg}")
 
 
 def detect_pe_subsystem(exe_path):
@@ -456,6 +552,11 @@ def cmd_exec(args):
                 os.makedirs(WINEPREFIX_TEMPLATE, exist_ok=True)
                 template_env = env.copy()
                 template_env["WINEPREFIX"] = WINEPREFIX_TEMPLATE
+                # Disable Wine Mono and Gecko installation during wineboot.
+                # The AppImage doesn't bundle Wine Mono/Gecko, so wineboot
+                # would hang forever showing the "Wine Mono Installer" dialog.
+                # Disabling mscoree/mshtml prevents the installer from launching.
+                template_env["WINEDLLOVERRIDES"] = "mscoree=d;mshtml=d"
 
                 # Build a special bwrap_base for template creation that binds
                 # WINEPREFIX_TEMPLATE (since bwrap_base binds session_work,
@@ -515,11 +616,48 @@ def cmd_exec(args):
                                 os.symlink(f"/opt/wine-devel/lib/wine/i386-windows/{f}", fp)
                             except Exception:
                                 pass
+                # Mirror all COM CLSIDs from 64-bit to 32-bit (Wow6432Node) view.
+                # This is critical for 32-bit games that use CoCreateInstance with
+                # KEY_WOW64_32KEY (e.g. MBAA.exe uses DxDiagProvider which needs
+                # dxdiagn.dll, wbemprox.dll, mmdevapi.dll registered in 32-bit view).
+                # Without this, CoCreateInstance returns REGDB_E_CLASSNOTREG and
+                # the game crashes with a NULL pointer dereference.
+                mirror_clsids_to_wow64(WINEPREFIX_TEMPLATE, wine_dir)
+
+                # Create .update-timestamp marker to prevent wineboot from
+                # running again in sessions (which would trigger the Wine Mono
+                # installer and hang). The timestamp must be newer than wine.inf.
+                try:
+                    wine_inf = os.path.join(wine_dir, "share", "wine", "wine.inf")
+                    if os.path.exists(wine_inf):
+                        ts = int(os.path.getmtime(wine_inf)) + 3600
+                    else:
+                        ts = int(time.time())
+                    with open(os.path.join(WINEPREFIX_TEMPLATE, "drive_c", ".update-timestamp"), "w") as f:
+                        f.write(str(ts))
+                except Exception:
+                    pass
+
                 debug_log(f"Wineprefix template created at {WINEPREFIX_TEMPLATE}")
 
             # Copy template to session wineprefix (fast — just a directory copy)
             debug_log(f"Copying wineprefix template to {wineprefix}")
             shutil.copytree(WINEPREFIX_TEMPLATE, wineprefix, symlinks=True)
+
+            # Ensure .update-timestamp exists in session prefix too (prevents
+            # wineboot from running and triggering Wine Mono installer)
+            try:
+                ts_file = os.path.join(wineprefix, "drive_c", ".update-timestamp")
+                if not os.path.exists(ts_file):
+                    wine_inf = os.path.join(wine_dir, "share", "wine", "wine.inf")
+                    if os.path.exists(wine_inf):
+                        ts = int(os.path.getmtime(wine_inf)) + 3600
+                    else:
+                        ts = int(time.time())
+                    with open(ts_file, "w") as f:
+                        f.write(str(ts))
+            except Exception:
+                pass
         except Exception as e:
             print_error("WINEBOOT_FAILED", f"Failed to initialize Wine prefix: {e}")
 
