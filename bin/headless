@@ -132,16 +132,16 @@ def detect_pe_arch(exe_path):
         return "unknown"
 
 
-def get_wine_binary_for_arch(arch):
-    """Return the Wine binary path (INSIDE the bwrap sandbox) to use for a given
-    PE architecture. The path is always /usr/lib/wine/wine64 because:
-    - For x86_64 PE: wine64 directly executes the 64-bit loader.
-    - For i386 PE: wine64 dispatches to Wine's WoW64 mode (Wine 9.0+), which
-      runs 32-bit PE binaries via PE-only thunks without needing i386 unix libs.
-    The bwrap sandbox has /usr/lib/wine bind-mounted from the prefix, so this
-    path resolves correctly inside the sandbox."""
-    # Path INSIDE the bwrap sandbox (NOT the host path)
-    return "/usr/lib/wine/wine64"
+def get_wine_binary():
+    """Return the Wine binary path INSIDE the bwrap sandbox.
+    Wine 11 from WineHQ installs to /opt/wine-devel/ with hardcoded paths.
+    The single 'wine' binary handles both 32-bit and 64-bit PE via WoW64."""
+    return "/opt/wine-devel/bin/wine"
+
+
+def get_wine_dir():
+    """Return the host path to the Wine installation directory."""
+    return os.path.join(get_prefix_dir(), "opt", "wine-devel")
 
 def find_free_display():
     for i in range(99, 200):
@@ -374,6 +374,7 @@ def cmd_exec(args):
 
     # 2. Init WINEPREFIX
     prefix_dir = get_prefix_dir()
+    wine_dir = get_wine_dir()
     bwrap_base = [
         f"{prefix_dir}/usr/bin/bwrap",
         "--ro-bind", "/usr", "/host-usr",
@@ -385,101 +386,98 @@ def cmd_exec(args):
         "--bind", "/tmp", "/tmp",
         "--bind", session_work, session_work,
         "--bind", f"{rootfs}/usr", "/usr",
-        "--ro-bind", f"{prefix_dir}/usr/lib/wine", "/usr/lib/wine",
-        "--ro-bind", f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine", "/usr/lib/x86_64-linux-gnu/wine",
-        # 32-bit (i386) Wine support via WoW64 — mount the i386-windows DLLs
-        # so 32-bit PE binaries can load them via syswow64.
-        "--ro-bind", f"{prefix_dir}/usr/lib/i386-linux-gnu/wine", "/usr/lib/i386-linux-gnu/wine",
-        "--ro-bind", f"{prefix_dir}/usr/share/wine", "/usr/share/wine",
-        "--ro-bind", f"{prefix_dir}/usr/share/vulkan", "/usr/share/vulkan",
+        # Wine 11 (WineHQ) installs to /opt/wine-devel/ with hardcoded paths.
+        # Mount the entire wine_dir there so all binaries, .so files, and PE DLLs
+        # are found at their expected locations.
+        # Wine 11's new WoW64 (PE-only) handles 32-bit PE WITHOUT needing
+        # 32-bit ELF wine binary, ld-linux.so.2, or i386-unix .so files.
+        "--ro-bind", wine_dir, "/opt/wine-devel",
         "--proc", "/proc",
         "--dev", "/dev"
     ]
 
-    # 32-bit support: if the prefix has the patched 32-bit wine binary and
-    # ld-linux.so.2, add the extra bind mounts needed for WoW64.
-    ld_linux_32 = f"{prefix_dir}/usr/lib/ld-linux.so.2"
-    wine32_bin = f"{prefix_dir}/usr/lib/wine/wine"
-    i386_lib_dir = f"{prefix_dir}/usr/lib/i386-linux-gnu"
-    if os.path.exists(ld_linux_32) and os.path.exists(wine32_bin) and os.path.isdir(i386_lib_dir):
-        bwrap_base.extend([
-            "--ro-bind", ld_linux_32, "/usr/lib/ld-linux.so.2",
-            "--ro-bind", i386_lib_dir, "/usr/lib/i386-linux-gnu",
-        ])
-
     env = os.environ.copy()
     env["DISPLAY"] = display
     env["WINEPREFIX"] = wineprefix
-    # Include i386-unix .so path so the 32-bit wine binary can find its Unix-side libs
-    ld_path = "/usr/lib/x86_64-linux-gnu/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib"
-    if os.path.isdir(f"{prefix_dir}/usr/lib/i386-linux-gnu/wine/i386-unix"):
-        ld_path = "/usr/lib/x86_64-linux-gnu/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu/wine/i386-unix:/usr/lib/i386-linux-gnu:/usr/lib"
-    env["LD_LIBRARY_PATH"] = ld_path
+    env["LD_LIBRARY_PATH"] = "/opt/wine-devel/lib/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib"
     env["VK_ICD_FILENAMES"] = "/usr/share/vulkan/icd.d/lvp_icd.json"
     env["WINEDEBUG"] = "-all"
+    env["PATH"] = "/opt/wine-devel/bin:/usr/bin:/bin"
 
     # Run wineboot if registry not created
     if not os.path.exists(os.path.join(wineprefix, "drive_c/windows/system32/user32.dll")):
         os.makedirs(wineprefix, exist_ok=True)
         try:
-            # Init wineboot
-            res = subprocess.run(bwrap_base + ["/usr/lib/wine/wine64", "wineboot.exe", "-u"], env=env, capture_output=True)
+            # Wine 11 wineboot hangs in bwrap before creating syswow64.
+            # Run it in background with setsid, poll for user.reg, then kill.
+            wb_proc = subprocess.Popen(
+                bwrap_base + ["/opt/wine-devel/bin/wine", "wineboot.exe", "-u"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                preexec_fn=os.setsid
+            )
+            for _ in range(40):
+                time.sleep(1)
+                if os.path.exists(os.path.join(wineprefix, "user.reg")):
+                    break
+                if wb_proc.poll() is not None:
+                    break
+            try:
+                os.killpg(os.getpgid(wb_proc.pid), 9)
+            except Exception:
+                pass
+            wb_proc.wait()
+
             user32_path = os.path.join(wineprefix, "drive_c/windows/system32/user32.dll")
             if not os.path.exists(user32_path):
-                stdout_str = res.stdout.decode("utf-8", errors="replace")
-                stderr_str = res.stderr.decode("utf-8", errors="replace")
-                print_error("WINEBOOT_FAILED", f"wineboot.exe -u failed to create prefix: stdout={stdout_str} stderr={stderr_str}")
-            # Copy zlib1.dll
-            subprocess.run(["cp", f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/zlib1.dll", f"{wineprefix}/drive_c/windows/system32/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                print_error("WINEBOOT_FAILED", "wineboot.exe -u failed to create system32/user32.dll")
+
+            # Copy zlib1.dll (Wine 11 from WineHQ doesn't bundle it)
+            wine_dir = get_wine_dir()
+            subprocess.run(["cp", f"{wine_dir}/lib/wine/x86_64-windows/zlib1.dll", f"{wineprefix}/drive_c/windows/system32/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
             # Set graphics driver to x11
-            res = subprocess.run(bwrap_base + ["/usr/lib/wine/wine64", "reg", "add", "HKCU\\Software\\Wine\\Drivers", "/v", "Graphics", "/d", "x11", "/f"], env=env, capture_output=True)
-            if res.returncode != 0:
-                stdout_str = res.stdout.decode("utf-8", errors="replace")
-                stderr_str = res.stderr.decode("utf-8", errors="replace")
-                print_error("REG_ADD_FAILED", f"reg add failed: stdout={stdout_str} stderr={stderr_str}")
-            
+            reg_proc = subprocess.Popen(
+                bwrap_base + ["/opt/wine-devel/bin/wine", "reg", "add", "HKCU\\Software\\Wine\\Drivers", "/v", "Graphics", "/d", "x11", "/f"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                preexec_fn=os.setsid
+            )
+            try:
+                reg_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(reg_proc.pid), 9)
+                except Exception:
+                    pass
+                reg_proc.wait()
+
             # Symlink duplicate dlls to save space
             sys32 = f"{wineprefix}/drive_c/windows/system32"
-            src_dir = f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine/x86_64-windows"
+            src_dir = f"{wine_dir}/lib/wine/x86_64-windows"
             for f in os.listdir(sys32):
                 fp = os.path.join(sys32, f)
                 if os.path.isfile(fp) and f != "zlib1.dll":
                     if os.path.exists(os.path.join(src_dir, f)):
                         os.remove(fp)
-                        os.symlink(f"/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/{f}", fp)
+                        os.symlink(f"/opt/wine-devel/lib/wine/x86_64-windows/{f}", fp)
 
-            # 32-bit (WoW64) support: populate syswow64/ with symlinks to i386-windows DLLs.
-            # Debian's wine64 alone does NOT populate syswow64 (it requires wine32:i386
-            # installed via multiarch). We work around this by manually creating symlinks
-            # from syswow64/<dll> -> /usr/lib/i386-linux-gnu/wine/i386-windows/<dll>.
-            # This is only done if the i386-windows DLLs are present in the prefix
-            # (i.e., the user ran the 32-bit setup script).
-            i386_src = f"{prefix_dir}/usr/lib/i386-linux-gnu/wine/i386-windows"
-            # Also check the x86_64-linux-gnu/wine/i386-windows/ dir (where build-from-scratch
-            # might place them)
-            i386_src_alt = f"{prefix_dir}/usr/lib/x86_64-linux-gnu/wine/i386-windows"
-            i386_dir = i386_src if os.path.isdir(i386_src) else (i386_src_alt if os.path.isdir(i386_src_alt) else None)
-            if i386_dir:
+            # Wine 11 wineboot doesn't populate syswow64/ (known issue in bwrap).
+            # Manually create symlinks to i386-windows/ PE DLLs.
+            # Wine 11's new WoW64 (PE-only) uses these to run 32-bit apps
+            # WITHOUT needing 32-bit ELF wine binary or i386-unix .so files.
+            i386_src = f"{wine_dir}/lib/wine/i386-windows"
+            if os.path.isdir(i386_src):
                 syswow = f"{wineprefix}/drive_c/windows/syswow64"
                 os.makedirs(syswow, exist_ok=True)
-                # Determine the in-sandbox path for the symlink target
-                if i386_dir == i386_src:
-                    target_base = "/usr/lib/i386-linux-gnu/wine/i386-windows"
-                else:
-                    target_base = "/usr/lib/x86_64-linux-gnu/wine/i386-windows"
                 populated = 0
-                for f in os.listdir(i386_dir):
+                for f in os.listdir(i386_src):
                     fp = os.path.join(syswow, f)
-                    # Only create symlink if file doesn't exist or is a regular file
-                    if not os.path.lexists(fp) or (os.path.isfile(fp) and not os.path.islink(fp)):
+                    if not os.path.lexists(fp):
                         try:
-                            if os.path.lexists(fp):
-                                os.remove(fp)
-                            os.symlink(f"{target_base}/{f}", fp)
+                            os.symlink(f"/opt/wine-devel/lib/wine/i386-windows/{f}", fp)
                             populated += 1
                         except Exception:
                             pass
-                debug_log(f"Populated syswow64/ with {populated} i386 DLL symlinks from {target_base}")
+                debug_log(f"Populated syswow64/ with {populated} i386 DLL symlinks")
         except Exception as e:
             print_error("WINEBOOT_FAILED", f"Failed to initialize Wine prefix: {e}")
 
@@ -521,18 +519,21 @@ def cmd_exec(args):
         pe_arch = "unknown"  # can't read the file from host
     else:
         pe_arch = detect_pe_arch(exe_path)
-    wine_binary = get_wine_binary_for_arch(pe_arch)
+    wine_binary = get_wine_binary()
 
     exe_dir = os.path.dirname(exe_path) if not windows_path else None
 
     # Re-build BWRAP arguments to include user exe path binding (only for host paths)
+    # Also bind the CWD so Wine can chdir to it (Wine needs the working directory)
+    cwd = os.getcwd()
+    cwd_bind = ["--bind", cwd, cwd] if os.path.exists(cwd) else []
     if windows_path:
         # Pass the Windows path as-is to Wine — Wine resolves it inside the sandbox
-        bwrap_run = bwrap_base + [
+        bwrap_run = bwrap_base + cwd_bind + [
             wine_binary, windows_path
         ] + args.args
     else:
-        bwrap_run = bwrap_base + [
+        bwrap_run = bwrap_base + cwd_bind + [
             "--bind", exe_dir, exe_dir,
             wine_binary, exe_path
         ] + args.args
@@ -821,7 +822,7 @@ def cmd_kill(args):
     # Scoped wineserver -k (graceful shutdown)
     env = os.environ.copy()
     env["WINEPREFIX"] = wineprefix
-    wineserver_bin = f"{get_prefix_dir()}/usr/bin/wineserver"
+    wineserver_bin = f"{get_wine_dir()}/bin/wineserver"
     if os.path.exists(wineserver_bin):
         subprocess.run([wineserver_bin, "-k"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

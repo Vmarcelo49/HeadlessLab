@@ -122,7 +122,7 @@ ok "libc.so.6 -> $PREFIX/usr/lib/i386-linux-gnu/"
 # 3. Patch the 32-bit wine binary to use /usr/lib/ld-linux.so.2 as interpreter
 echo ""
 echo "=== 3. Patching 32-bit wine binary interpreter ==="
-WINE32_BIN="$PREFIX/usr/lib/wine/wine"
+WINE32_BIN="$PREFIX/usr/lib/i386-linux-gnu/wine/wine"
 if [ ! -f "$WINE32_BIN" ]; then
     fail "32-bit wine binary not found at $WINE32_BIN"
     exit 1

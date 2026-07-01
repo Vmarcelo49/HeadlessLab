@@ -29,9 +29,10 @@ rm -rf "$APPDIR"
 rm -f "$OUT_FILE"
 
 # 1. Create AppDir and copy prefix contents
-echo ">> Copying prefix files to AppDir/usr..."
-mkdir -p "$APPDIR/usr"
-cp -rp "$PREFIX/usr/"* "$APPDIR/usr/"
+# Wine 11 (WineHQ) uses /opt/wine-devel/ layout — copy the entire prefix
+echo ">> Copying prefix to AppDir..."
+mkdir -p "$APPDIR"
+cp -rp "$PREFIX/"* "$APPDIR/"
 
 # 2. Copy examples and required binaries into the AppImage
 echo ">> Copying control scripts and examples to AppDir..."
