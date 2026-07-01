@@ -2424,6 +2424,312 @@ def cmd_clipboard(args):
         print_json({"status": "ok", "text": clip_text})
 
 
+def _resolve_wine_path(wineprefix, windows_path):
+    """Convert a Windows path (C:\\users\\...) to a Unix path inside the
+    wineprefix's drive_c directory. Supports C:\\ and Z:\\ (host paths)."""
+    # Normalize separators
+    wp = windows_path.replace("/", "\\")
+    # Check drive letter
+    if len(wp) >= 2 and wp[1] == ":":
+        drive = wp[0].lower()
+        rest = wp[2:].lstrip("\\")
+        if drive == "z":
+            # Z:\ maps to host filesystem directly
+            return "/" + rest.replace("\\", "/")
+        elif drive == "c":
+            # C:\ maps to wineprefix/drive_c/
+            return os.path.join(wineprefix, "drive_c", rest.replace("\\", "/"))
+        else:
+            # Other drives (D:, E:, etc.) — check dosdevices
+            dosdevice = os.path.join(wineprefix, "dosdevices", drive + ":")
+            if os.path.lexists(dosdevice):
+                real = os.path.realpath(dosdevice)
+                return os.path.join(real, rest.replace("\\", "/"))
+    return None
+
+
+def cmd_file_read(args):
+    """Read a file inside the Wine prefix's C:\\ drive (or any mapped drive).
+    Accepts Windows paths (C:\\users\\...) or Unix paths."""
+    file_path = args.path
+    session_id = args.session
+
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+
+    wineprefix = sess["wineprefix"]
+
+    # Try to resolve as Windows path first
+    unix_path = _resolve_wine_path(wineprefix, file_path)
+    if unix_path is None or not os.path.exists(unix_path):
+        # Try as direct Unix path
+        if os.path.exists(file_path):
+            unix_path = file_path
+        else:
+            print_error("FILE_NOT_FOUND",
+                f"File not found: {file_path} (resolved to {unix_path})")
+
+    if not os.path.isfile(unix_path):
+        print_error("NOT_A_FILE", f"Path is not a regular file: {file_path}")
+
+    # Check file size (limit to 1MB to avoid huge outputs)
+    file_size = os.path.getsize(unix_path)
+    max_size = 1024 * 1024  # 1MB
+    truncated = False
+    if file_size > max_size:
+        truncated = True
+
+    try:
+        with open(unix_path, "rb") as f:
+            data = f.read(max_size)
+    except Exception as e:
+        print_error("READ_FAILED", f"Failed to read {file_path}: {e}")
+
+    # Try to decode as text
+    text = None
+    for encoding in ("utf-8", "utf-16-le", "utf-16-be", "latin-1", "ascii"):
+        try:
+            text = data.decode(encoding)
+            detected_encoding = encoding
+            break
+        except (UnicodeDecodeError, ValueError):
+            continue
+
+    response = {
+        "status": "ok",
+        "path": file_path,
+        "resolved": unix_path,
+        "size": file_size,
+        "truncated": truncated,
+    }
+
+    if text is not None:
+        response["encoding"] = detected_encoding
+        response["text"] = text
+    else:
+        # Binary file — return base64
+        import base64
+        response["encoding"] = "base64"
+        response["data"] = base64.b64encode(data).decode("ascii")
+
+    print_json(response)
+
+
+def cmd_file_write(args):
+    """Write text to a file inside the Wine prefix's C:\\ drive."""
+    file_path = args.path
+    content = args.content
+    session_id = args.session
+
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found")
+
+    wineprefix = sess["wineprefix"]
+
+    unix_path = _resolve_wine_path(wineprefix, file_path)
+    if unix_path is None:
+        print_error("INVALID_PATH", f"Could not resolve path: {file_path}")
+
+    # Create parent directories if needed
+    parent = os.path.dirname(unix_path)
+    if parent and not os.path.exists(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception as e:
+            print_error("MKDIR_FAILED", f"Failed to create directory: {e}")
+
+    try:
+        with open(unix_path, "w") as f:
+            f.write(content)
+    except Exception as e:
+        print_error("WRITE_FAILED", f"Failed to write {file_path}: {e}")
+
+    print_json({"status": "ok", "path": file_path, "resolved": unix_path, "bytes_written": len(content)})
+
+
+def cmd_diff(args):
+    """Take two screenshots with an interval and compare them.
+    Returns the percentage of pixels that changed. Useful for detecting
+    whether the screen is animating/loading or static/hung."""
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    interval = getattr(args, 'interval', 1.0)
+    threshold = getattr(args, 'threshold', 1.0)  # % of pixels that must differ
+    import_bin = shutil.which("import")
+
+    if not import_bin:
+        print_error("SCREENSHOT_FAILED", "ImageMagick 'import' not found")
+
+    shot1 = f"/tmp/diff_1_{int(time.time())}.png"
+    shot2 = f"/tmp/diff_2_{int(time.time())}.png"
+
+    # Capture first frame
+    try:
+        subprocess.run([import_bin, "-window", "root", shot1],
+                      env=env, check=True, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print_error("SCREENSHOT_FAILED", f"First capture failed: {e}")
+
+    # Wait
+    time.sleep(interval)
+
+    # Capture second frame
+    try:
+        subprocess.run([import_bin, "-window", "root", shot2],
+                      env=env, check=True, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print_error("SCREENSHOT_FAILED", f"Second capture failed: {e}")
+
+    # Compare
+    try:
+        from PIL import Image
+        img1 = Image.open(shot1).convert("RGB")
+        img2 = Image.open(shot2).convert("RGB")
+
+        # Ensure same size
+        if img1.size != img2.size:
+            print_error("SIZE_MISMATCH",
+                f"Screenshot sizes differ: {img1.size} vs {img2.size}")
+
+        # Sample every 4th pixel for speed
+        w, h = img1.size
+        total = 0
+        changed = 0
+        for y in range(0, h, 2):
+            for x in range(0, w, 2):
+                p1 = img1.getpixel((x, y))
+                p2 = img2.getpixel((x, y))
+                total += 1
+                if abs(p1[0]-p2[0]) > 10 or abs(p1[1]-p2[1]) > 10 or abs(p1[2]-p2[2]) > 10:
+                    changed += 1
+
+        diff_percent = (changed / total * 100) if total > 0 else 0
+        is_changed = diff_percent > threshold
+    except Exception as e:
+        print_error("DIFF_FAILED", str(e))
+    finally:
+        try:
+            os.remove(shot1)
+            os.remove(shot2)
+        except Exception:
+            pass
+
+    print_json({
+        "status": "ok",
+        "changed": is_changed,
+        "diff_percent": round(diff_percent, 2),
+        "diff_pixels_sampled": changed,
+        "total_pixels_sampled": total,
+        "threshold_percent": threshold,
+        "interval_s": interval,
+        "message": "Screen changed" if is_changed else "Screen unchanged"
+    })
+
+
+def cmd_wait_stable(args):
+    """Wait until the screen stops changing (consecutive frames are
+    identical within a threshold). Useful for waiting until loading
+    screens, transitions, or animations complete."""
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    timeout_ms = getattr(args, 'timeout', 15000)
+    stable_frames = getattr(args, 'stable_frames', 3)  # consecutive identical frames
+    poll_interval = getattr(args, 'poll_interval', 0.5)  # seconds between captures
+    threshold = getattr(args, 'threshold', 0.5)  # % of pixels that must differ to count as "changed"
+    import_bin = shutil.which("import")
+
+    if not import_bin:
+        print_error("SCREENSHOT_FAILED", "ImageMagick 'import' not found")
+
+    start_time = time.time()
+    consecutive_stable = 0
+    frames_checked = 0
+    prev_pixels = None
+
+    from PIL import Image
+
+    while (time.time() - start_time) * 1000 < timeout_ms:
+        shot = f"/tmp/stable_{int(time.time()*1000)}.png"
+        try:
+            subprocess.run([import_bin, "-window", "root", shot],
+                          env=env, check=True, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            time.sleep(poll_interval)
+            continue
+
+        try:
+            img = Image.open(shot).convert("RGB")
+            w, h = img.size
+            # Sample pixels for comparison
+            curr_pixels = []
+            for y in range(0, h, 8):
+                for x in range(0, w, 8):
+                    curr_pixels.append(img.getpixel((x, y)))
+
+            if prev_pixels is not None:
+                total = len(curr_pixels)
+                changed = sum(1 for a, b in zip(curr_pixels, prev_pixels)
+                            if abs(a[0]-b[0]) > 10 or abs(a[1]-b[1]) > 10 or abs(a[2]-b[2]) > 10)
+                diff_percent = (changed / total * 100) if total > 0 else 0
+
+                if diff_percent < threshold:
+                    consecutive_stable += 1
+                else:
+                    consecutive_stable = 0
+
+                frames_checked += 1
+
+                if consecutive_stable >= stable_frames:
+                    elapsed = int((time.time() - start_time) * 1000)
+                    try:
+                        os.remove(shot)
+                    except Exception:
+                        pass
+                    print_json({
+                        "status": "ok",
+                        "stable": True,
+                        "elapsed_ms": elapsed,
+                        "frames_checked": frames_checked,
+                        "consecutive_stable": consecutive_stable,
+                        "message": "Screen has stabilized"
+                    })
+                    return
+            else:
+                frames_checked += 1
+
+            prev_pixels = curr_pixels
+        except Exception:
+            pass
+
+        try:
+            os.remove(shot)
+        except Exception:
+            pass
+
+        time.sleep(poll_interval)
+
+    # Timeout
+    elapsed = int((time.time() - start_time) * 1000)
+    print_json({
+        "status": "timeout",
+        "stable": False,
+        "elapsed_ms": elapsed,
+        "frames_checked": frames_checked,
+        "consecutive_stable": consecutive_stable,
+        "message": "Screen did not stabilize within timeout"
+    })
+    sys.exit(2)
+
+
 def cmd_windows(args):
     display = _resolve_display(args, required_session=False)
     env = os.environ.copy()
@@ -3182,6 +3488,49 @@ def main():
     parser_clip.add_argument("--session", help="Session ID (required if multiple sessions active)")
     parser_clip.add_argument("--display", help="X11 display (alternative to --session)")
 
+    # Command: file-read
+    parser_file_read = subparsers.add_parser("file-read",
+        help="Read a file inside the Wine prefix (C:\\ drive)",
+        description="Read a file from the Wine prefix's C:\\ drive. Accepts Windows paths (C:\\users\\...) or Unix paths. Auto-detects encoding (utf-8, utf-16, latin-1). Binary files are returned as base64.",
+        epilog='Examples:\n  headless file-read C:\\\\users\\\\steamuser\\\\Documents\\\\save.dat --session sess_...\n  headless file-read "C:\\\\Program Files\\\\app\\\\config.ini" --session sess_...\n  → {"status":"ok","text":"file contents...","encoding":"utf-8","size":1234}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_file_read.add_argument("path", help="Windows path (C:\\...) or Unix path to the file")
+    parser_file_read.add_argument("--session", required=True, help="Session ID")
+
+    # Command: file-write
+    parser_file_write = subparsers.add_parser("file-write",
+        help="Write text to a file inside the Wine prefix (C:\\ drive)",
+        description="Write text to a file in the Wine prefix's C:\\ drive. Creates parent directories if needed. Accepts Windows paths (C:\\users\\...).",
+        epilog='Example:\n  headless file-write C:\\\\users\\\\steamuser\\\\settings.ini --content "[Display]\\nWidth=1920" --session sess_...',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_file_write.add_argument("path", help="Windows path (C:\\...) for the file")
+    parser_file_write.add_argument("--content", required=True, help="Text content to write")
+    parser_file_write.add_argument("--session", required=True, help="Session ID")
+
+    # Command: diff
+    parser_diff = subparsers.add_parser("diff",
+        help="Take 2 screenshots and compare — has the screen changed?",
+        description="Capture two screenshots with an interval between them and compare pixels. Returns the percentage of pixels that changed. Useful for detecting whether the app is animating/loading or static/hung.",
+        epilog='Examples:\n  headless diff --session sess_...                  (1s interval, default)\n  headless diff --session sess_... --interval 2     (2s interval)\n  headless diff --session sess_... --threshold 5    (5%% changed = "changed")\n  → {"status":"ok","changed":true,"diff_percent":15.3,"message":"Screen changed"}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_diff.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_diff.add_argument("--display", help="X11 display (alternative to --session)")
+    parser_diff.add_argument("--interval", type=float, default=1.0, help="Seconds between captures (default: 1.0)")
+    parser_diff.add_argument("--threshold", type=float, default=1.0, help="Percent of pixels that must differ to count as changed (default: 1.0)")
+
+    # Command: wait-stable
+    parser_wait_stable = subparsers.add_parser("wait-stable",
+        help="Wait until the screen stops changing (loading finished)",
+        description="Poll screenshots until consecutive frames are identical (within threshold). Returns when the screen has been stable for N consecutive frames. Useful for waiting until loading screens, transitions, or animations complete.",
+        epilog='Examples:\n  headless wait-stable --session sess_...                          (default: 15s timeout, 3 stable frames)\n  headless wait-stable --session sess_... --timeout 30000          (30s timeout)\n  headless wait-stable --session sess_... --stable-frames 5        (need 5 identical frames)\n  → {"status":"ok","stable":true,"elapsed_ms":3200,"message":"Screen has stabilized"}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_wait_stable.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_wait_stable.add_argument("--display", help="X11 display (alternative to --session)")
+    parser_wait_stable.add_argument("--timeout", type=int, default=15000, help="Timeout in ms (default: 15000)")
+    parser_wait_stable.add_argument("--stable-frames", type=int, default=3, help="Consecutive identical frames needed (default: 3)")
+    parser_wait_stable.add_argument("--poll-interval", type=float, default=0.5, help="Seconds between captures (default: 0.5)")
+    parser_wait_stable.add_argument("--threshold", type=float, default=0.5, help="Percent of pixels that must differ to count as changed (default: 0.5)")
+
     # Command: windows
     parser_windows = subparsers.add_parser("windows",
         help="List all open windows (detects modals)",
@@ -3267,8 +3616,12 @@ def main():
         "focus": cmd_focus,
         "accept-dialog": cmd_accept_dialog,
         "wait-window": cmd_wait_window,
+        "wait-stable": cmd_wait_stable,
         "register-dll": cmd_register_dll,
-        "metrics": cmd_metrics
+        "metrics": cmd_metrics,
+        "file-read": cmd_file_read,
+        "file-write": cmd_file_write,
+        "diff": cmd_diff
     }
 
     try:
