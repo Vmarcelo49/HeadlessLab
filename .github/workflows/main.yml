@@ -18,7 +18,6 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo dpkg --add-architecture i386 || true
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             xvfb openbox xdotool wmctrl x11-utils xclip imagemagick \
@@ -27,12 +26,18 @@ jobs:
             binutils-mingw-w64-i686 gcc-mingw-w64-i686-win32 g++-mingw-w64-i686-win32 \
             binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64-win32 g++-mingw-w64-x86-64-win32 \
             python3 python3-xlib python3-pil
-          # WineHQ key + repo for Wine 11
-          sudo mkdir -p /etc/apt/keyrings
-          wget -qO- https://dl.winehq.org/wine-builds/winehq.key | sudo gpg --dearmor -o /etc/apt/keyrings/winehq.gpg
-          echo "deb [signed-by=/etc/apt/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/debian/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/winehq.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --install-recommends wine-devel wine-devel-amd64 wine-devel-i386
+
+      - name: Download Wine 11 from WineHQ pool
+        run: |
+          # WineHQ doesn't have an Ubuntu repo, so download .deb files directly
+          # from the Debian pool. This works on any Linux distro.
+          WINE_VER="11.12~trixie-1"
+          WINEHQ_POOL="https://dl.winehq.org/wine-builds/debian/pool/main/w/wine"
+          mkdir -p /tmp/wine-debs && cd /tmp/wine-debs
+          curl -sSL -o wine-devel.deb "$WINEHQ_POOL/wine-devel_${WINE_VER}_amd64.deb"
+          curl -sSL -o wine-devel-amd64.deb "$WINEHQ_POOL/wine-devel-amd64_${WINE_VER}_amd64.deb"
+          curl -sSL -o wine-devel-i386.deb "$WINEHQ_POOL/wine-devel-i386_${WINE_VER}_i386.deb"
+          ls -lh *.deb
 
       - name: Build prefix (Wine 11 from WineHQ)
         run: |
@@ -40,10 +45,10 @@ jobs:
           PREFIX="$PWD/prefix"
           mkdir -p "$PREFIX"
 
-          # Extract Wine 11 packages into prefix/opt/wine-devel/
-          dpkg-deb -x /var/cache/apt/archives/wine-devel_*amd64.deb "$PREFIX/" || true
-          dpkg-deb -x /var/cache/apt/archives/wine-devel-amd64_*amd64.deb "$PREFIX/"
-          dpkg-deb -x /var/cache/apt/archives/wine-devel-i386_*i386.deb "$PREFIX/"
+          # Extract Wine 11 packages from downloaded .deb files
+          dpkg-deb -x /tmp/wine-debs/wine-devel.deb "$PREFIX/"
+          dpkg-deb -x /tmp/wine-debs/wine-devel-amd64.deb "$PREFIX/"
+          dpkg-deb -x /tmp/wine-debs/wine-devel-i386.deb "$PREFIX/"
 
           # Clean up
           find "$PREFIX/opt/wine-devel/lib/wine/" -name "*.a" -delete
