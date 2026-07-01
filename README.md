@@ -18,7 +18,7 @@ HeadlessLab provides a unified Python CLI (`headless`) that lets AI agents and a
 
 ## Quick Start (Recommended: Download AppImage — no compilation needed)
 
-The fastest way to get started. Download the pre-built AppImage from GitHub Releases — it contains everything (Wine 10, Mesa llvmpipe, bwrap, the `headless` CLI, and example EXEs) in a single ~253MB file. **No compilation, no `apt-get download`, no `dpkg-deb -x` required.**
+The fastest way to get started. Download the pre-built AppImage from GitHub Releases — it contains everything (Wine 10, Mesa llvmpipe, bwrap, the `headless` CLI, and example EXEs) in a single file. **No compilation, no `apt-get download`, no `dpkg-deb -x` required.**
 
 ### Step 1 — Install host tools (one-time, ~10MB)
 
@@ -43,6 +43,7 @@ chmod +x HeadlessLab.AppImage
 ```
 
 ### Step 3 — Run
+Check your environment for FUSE
 
 In environments with FUSE (most desktops):
 
@@ -64,6 +65,7 @@ export APPDIR="$PWD"
 ./AppRun init
 ./AppRun exec /path/to/app.exe
 ```
+delete the AppImage to save space.
 
 ### Step 4 — Run your own Windows app
 
