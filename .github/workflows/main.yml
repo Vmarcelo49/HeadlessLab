@@ -2,8 +2,8 @@ name: Build and Release AppImage
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -139,11 +139,24 @@ jobs:
           path: HeadlessLab.AppImage
           retention-days: 30
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Update GitHub Release v1.0.0
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v1.0.0
           files: HeadlessLab.AppImage
-          generate_release_notes: true
+          name: "HeadlessLab v1.0.0"
+          body: |
+            ## HeadlessLab — Headless Windows GUI Runtime
+
+            Run Windows GUI apps headless on Linux (no sudo, no Docker, no GPU).
+            Wine 11.12 + Mesa llvmpipe + Bubblewrap. Supports 32-bit and 64-bit.
+
+            ### Install
+            ```bash
+            chmod +x HeadlessLab.AppImage
+            ./HeadlessLab.AppImage --verify
+            ```
+
+            See [README](https://github.com/Vmarcelo49/HeadlessLab#readme) for full docs.
           draft: false
-          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') }}
+          prerelease: false
