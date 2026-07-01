@@ -134,8 +134,70 @@ Run `headless --help` for the full reference with examples. Here's a summary:
 | `headless logs <sess_id>` | Get Wine + EXE stdout/stderr (auto UTF-16 decode) |
 | `headless list` | List all sessions |
 | `headless kill <sess_id>` | Kill session and free resources |
+| `headless monitor start --session <sess> --out <path>` | Start a live screen monitor (opt-in) |
+| `headless monitor stop [--session <sess>]` | Stop one or all monitors |
+| `headless monitor status` | List all monitors with state |
 
 **Every command returns a single JSON object to stdout.** Warnings go to stderr. Session cache lives at `~/.cache/headlesslab/`.
+
+---
+
+## Live Monitor Mode
+
+Spawn a detached subprocess that captures a session's X11 display every N seconds and atomically writes the latest PNG to a fixed path. **Opt-in** — must be explicitly started by the agent, never runs automatically.
+
+### Why use it
+
+- **LLM agents** can "see" the current state of a Wine session without invoking `headless screenshot` on every check (saves ~500ms per iteration)
+- **CI debugging** — capture the last frame before a test fails
+- **Live monitoring** — pair with [FileVault](https://github.com/Vmarcelo49/FileVault)'s Live View feature to watch a session from a web browser
+
+### Usage
+
+```bash
+# Start a monitor for a session
+headless monitor start --session sess_123 --out /tmp/live.png
+# → {"status":"ok","monitor_pid":12345,"out_path":"/tmp/live.png","interval_s":5.0,...}
+
+# Customize interval and use JPEG instead of PNG
+headless monitor start --session sess_123 --out /tmp/live.jpg --interval 2s --quality 85
+
+# Stop a specific monitor
+headless monitor stop --session sess_123
+
+# Stop ALL monitors
+headless monitor stop
+
+# Check status
+headless monitor status
+# → {"status":"ok","total":1,"active":1,"monitors":[{...}]}
+```
+
+### How it works
+
+- Spawns a **detached subprocess** (via `start_new_session=True`) that survives parent exit
+- Captures the X11 display **directly via python-xlib** (no subprocess per frame — ~50ms per capture vs ~460ms for `headless screenshot`)
+- **Hash-skip** identical frames: downscales to 64×64, MD5, skips write if unchanged
+- **Atomic writes**: `live.png.tmp` + `os.rename()` (no torn reads for HTTP servers)
+- **Auto-stop**: detects when the Wine session dies (checks `registry.json` + `/proc/<pid>`) and exits with `status=session_gone`
+- **Graceful shutdown**: SIGTERM → finishes current iteration → writes final state → exit 0
+
+### State files
+
+```
+~/.cache/headlesslab/monitors/
+├── monitor-<sess>.pid     # PID of the monitor subprocess
+├── monitor-<sess>.state   # JSON: pid, started_at, last_frame_at, frames_captured, ...
+├── monitor-<sess>.log     # Rotating log (max 1MB)
+└── _monitor_worker.py     # Auto-generated worker script
+```
+
+### Resource usage (measured on llvmpipe software rendering)
+
+- CPU: ~9% of one core during capture, drops to ~0% between captures
+- I/O: 39 KB PNG per frame (with hash-skip, often 0 KB when UI is static)
+- Memory: ~50 MB peak (Python + Xlib + PIL)
+- Disk: 1 file (the live PNG), overwritten in place
 
 ---
 

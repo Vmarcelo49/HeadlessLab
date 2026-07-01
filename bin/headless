@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import time
+import signal
 import subprocess
 import argparse
 import hashlib
@@ -2391,6 +2392,578 @@ def cmd_list(args):
     print_json({"status": "ok", "sessions": active_sessions})
 
 
+# ============================================================
+# MONITOR MODE — Live screen capture daemon
+# ============================================================
+# Spawns a detached subprocess that captures the X11 display of a session
+# every N seconds and atomically writes the latest PNG to a fixed path.
+# This is opt-in (agent must explicitly call `monitor start`) to preserve
+# resources — it does NOT run automatically.
+#
+# State files (in CACHE_DIR):
+#   monitor-<sess>.pid    — PID of the monitor subprocess
+#   monitor-<sess>.state  — JSON: {pid, started_at, last_frame_at, frames_captured, frames_skipped, ...}
+#   monitor-<sess>.log    — Log of monitor activity (rotating, max 1MB)
+
+MONITOR_DIR = os.path.join(CACHE_DIR, "monitors")
+os.makedirs(MONITOR_DIR, exist_ok=True)
+
+MONITOR_SCRIPT_PATH = os.path.join(MONITOR_DIR, "_monitor_worker.py")
+
+
+def _monitor_pid_file(session_id):
+    return os.path.join(MONITOR_DIR, f"monitor-{session_id}.pid")
+
+
+def _monitor_state_file(session_id):
+    return os.path.join(MONITOR_DIR, f"monitor-{session_id}.state")
+
+
+def _monitor_log_file(session_id):
+    return os.path.join(MONITOR_DIR, f"monitor-{session_id}.log")
+
+
+def _monitor_read_state(session_id):
+    """Read monitor state file. Returns dict or None."""
+    path = _monitor_state_file(session_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _monitor_write_state(session_id, state):
+    """Atomically write monitor state file."""
+    path = _monitor_state_file(session_id)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.rename(tmp, path)
+
+
+def _monitor_log(session_id, msg):
+    """Append a line to the monitor's log file (rotating, max 1MB)."""
+    try:
+        path = _monitor_log_file(session_id)
+        if os.path.exists(path) and os.path.getsize(path) > 1024 * 1024:
+            shutil.move(path, path + ".old")
+        with open(path, "a") as f:
+            f.write(f"[{iso_now()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _monitor_is_alive(session_id):
+    """Check if a monitor subprocess is still running for this session."""
+    pid_file = _monitor_pid_file(session_id)
+    if not os.path.exists(pid_file):
+        return False
+    try:
+        pid = int(open(pid_file).read().strip())
+        return os.path.exists(f"/proc/{pid}")
+    except Exception:
+        return False
+
+
+def _monitor_get_pid(session_id):
+    """Get PID of monitor subprocess, or None."""
+    pid_file = _monitor_pid_file(session_id)
+    if not os.path.exists(pid_file):
+        return None
+    try:
+        return int(open(pid_file).read().strip())
+    except Exception:
+        return None
+
+
+def _monitor_worker_script():
+    """Return the Python source of the worker script.
+
+    The worker is spawned as a separate process via subprocess.Popen with
+    start_new_session=True so it survives parent exit. It:
+      1. Opens the X11 display (once, reused)
+      2. Loops: capture → hash-skip → atomic write → sleep
+      3. Checks session liveness via SessionRegistry.get()
+      4. Exits on SIGTERM/SIGINT or SESSION_GONE
+    """
+    return '''#!/usr/bin/env python3
+"""Monitor worker — spawned by `headless monitor start`.
+Captures screenshots of a session's X11 display at intervals and
+atomically updates an output PNG file.
+
+Args (passed via env vars to avoid arg injection):
+  MONITOR_SESSION_ID  — session ID being monitored
+  MONITOR_DISPLAY     — X11 display to capture (e.g. :101)
+  MONITOR_OUT_PATH    — absolute path to output PNG
+  MONITOR_INTERVAL_S  — float, seconds between captures
+  MONITOR_QUALITY     — int or empty; if set, output JPEG with this quality
+  MONITOR_SKIP_IDENTICAL — "1" to skip frames whose downscale hash matches previous
+  MONITOR_CACHE_DIR   — headlesslab cache dir (for state files + session check)
+"""
+import os
+import sys
+import time
+import json
+import signal
+import hashlib
+
+# Add host deps to path (python-xlib)
+_host_local = os.path.expanduser("~/.local/usr/lib/python3/dist-packages")
+if os.path.isdir(_host_local) and _host_local not in sys.path:
+    sys.path.insert(0, _host_local)
+
+try:
+    from Xlib.display import Display as XlibDisplay
+    from Xlib import X
+    from PIL import Image
+except ImportError as e:
+    print(json.dumps({"status": "error", "code": "DEPS_MISSING",
+                      "message": f"python-xlib and Pillow required: {e}"}), flush=True)
+    sys.exit(2)
+
+SESSION_ID = os.environ["MONITOR_SESSION_ID"]
+DISPLAY = os.environ["MONITOR_DISPLAY"]
+OUT_PATH = os.environ["MONITOR_OUT_PATH"]
+INTERVAL_S = float(os.environ.get("MONITOR_INTERVAL_S", "5"))
+QUALITY = os.environ.get("MONITOR_QUALITY", "")
+SKIP_IDENTICAL = os.environ.get("MONITOR_SKIP_IDENTICAL", "1") == "1"
+CACHE_DIR = os.environ["MONITOR_CACHE_DIR"]
+
+STATE_FILE = os.path.join(CACHE_DIR, "monitors", f"monitor-{SESSION_ID}.state")
+PID_FILE = os.path.join(CACHE_DIR, "monitors", f"monitor-{SESSION_ID}.pid")
+LOG_FILE = os.path.join(CACHE_DIR, "monitors", f"monitor-{SESSION_ID}.log")
+REGISTRY_PATH = os.path.join(CACHE_DIR, "registry.json")
+
+# State
+running = True
+frames_captured = 0
+frames_skipped = 0
+last_hash = None
+started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+last_frame_at = None
+
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}\\n")
+    except Exception:
+        pass
+
+
+def write_state(extra=None):
+    state = {
+        "pid": os.getpid(),
+        "session_id": SESSION_ID,
+        "display": DISPLAY,
+        "out_path": OUT_PATH,
+        "interval_s": INTERVAL_S,
+        "quality": QUALITY or None,
+        "skip_identical": SKIP_IDENTICAL,
+        "started_at": started_at,
+        "last_frame_at": last_frame_at,
+        "frames_captured": frames_captured,
+        "frames_skipped": frames_skipped,
+        "last_hash": last_hash,
+        "running": running,
+    }
+    if extra:
+        state.update(extra)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.rename(tmp, STATE_FILE)
+
+
+def session_alive():
+    """Check if the Wine session is still registered and alive."""
+    try:
+        with open(REGISTRY_PATH) as f:
+            data = json.load(f)
+        sess = data.get("sessions", {}).get(SESSION_ID)
+        if not sess:
+            return False
+        pid = sess.get("pid")
+        if not pid:
+            return False
+        return os.path.exists(f"/proc/{pid}")
+    except Exception:
+        return False
+
+
+def capture_frame(disp, geom):
+    """Capture a frame from the X11 display. Returns PIL.Image."""
+    root = disp.screen().root
+    image = root.get_image(0, 0, geom.width, geom.height, X.ZPixmap, 0xFFFFFFFF)
+    if image.depth == 24:
+        return Image.frombytes("RGB", (geom.width, geom.height), image.data, "raw", "BGRX")
+    elif image.depth == 32:
+        return Image.frombytes("RGBA", (geom.width, geom.height), image.data, "raw", "BGRA")
+    elif image.depth == 16:
+        return Image.frombytes("RGB", (geom.width, geom.height), image.data, "raw", "BGR;16")
+    else:
+        raise RuntimeError(f"Unsupported X11 depth: {image.depth}")
+
+
+def compute_hash(img):
+    """Downscale to 64x64 and compute MD5. Used for skip-identical frames."""
+    small = img.resize((64, 64), Image.BILINEAR)
+    return hashlib.md5(small.tobytes()).hexdigest()
+
+
+def save_image(img):
+    """Save image atomically (tmp + rename)."""
+    tmp = OUT_PATH + ".tmp"
+    if QUALITY:
+        img.save(tmp, "JPEG", quality=int(QUALITY))
+    else:
+        img.save(tmp, "PNG")
+    os.rename(tmp, OUT_PATH)
+
+
+def handle_signal(signum, frame):
+    global running
+    running = False
+    log(f"Received signal {signum}, shutting down")
+
+
+def main():
+    global last_hash, last_frame_at, frames_captured, frames_skipped, running
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    log(f"Monitor started: session={SESSION_ID} display={DISPLAY} out={OUT_PATH} "
+        f"interval={INTERVAL_S}s quality={QUALITY or 'PNG'} skip_identical={SKIP_IDENTICAL}")
+    write_state({"status": "starting"})
+
+    # Open display once
+    try:
+        disp = XlibDisplay(DISPLAY)
+        root = disp.screen().root
+        geom = root.get_geometry()
+        log(f"Display {DISPLAY} geometry: {geom.width}x{geom.height} depth={root.get_geometry().depth}")
+    except Exception as e:
+        log(f"FATAL: could not open display: {e}")
+        write_state({"status": "error", "error": f"DISPLAY_OPEN_FAILED: {e}"})
+        sys.exit(3)
+
+    write_state({"status": "running"})
+
+    while running:
+        try:
+            # Check session liveness
+            if not session_alive():
+                log(f"Session {SESSION_ID} no longer alive, exiting")
+                write_state({"status": "session_gone", "ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "running": False})
+                break
+
+            # Capture
+            img = capture_frame(disp, geom)
+
+            # Hash-skip
+            if SKIP_IDENTICAL:
+                h = compute_hash(img)
+                if h == last_hash:
+                    frames_skipped += 1
+                    write_state({"status": "running"})
+                    time.sleep(INTERVAL_S)
+                    continue
+                last_hash = h
+
+            # Save atomically
+            save_image(img)
+            frames_captured += 1
+            last_frame_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_state({"status": "running"})
+
+            time.sleep(INTERVAL_S)
+
+        except KeyboardInterrupt:
+            running = False
+            break
+        except Exception as e:
+            log(f"Error in capture loop: {e}")
+            write_state({"status": "error", "last_error": str(e)})
+            time.sleep(INTERVAL_S)
+
+    # Cleanup
+    try:
+        disp.close()
+    except Exception:
+        pass
+    # Preserve special exit statuses (session_gone) — only set "stopped" if no
+    # special status was already recorded.
+    current_state = {}
+    try:
+        with open(STATE_FILE) as f:
+            current_state = json.load(f)
+    except Exception:
+        pass
+    ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    final_status = current_state.get("status", "stopped")
+    if final_status not in ("session_gone", "error"):
+        final_status = "stopped"
+    write_state({"status": final_status, "ended_at": ended_at, "running": False})
+    log(f"Monitor stopped: captured={frames_captured} skipped={frames_skipped}")
+
+    # Remove PID file
+    try:
+        os.unlink(PID_FILE)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def cmd_monitor(args):
+    """Dispatch monitor subcommand (start/stop/status)."""
+    sub = getattr(args, "monitor_subcommand", None)
+    if sub == "start":
+        _monitor_start(args)
+    elif sub == "stop":
+        _monitor_stop(args)
+    elif sub == "status":
+        _monitor_status(args)
+    else:
+        print_error("INVALID_SUBCOMMAND", f"Unknown monitor subcommand: {sub}")
+
+
+def _monitor_start(args):
+    """Start a monitor subprocess for a session."""
+    session_id = args.session
+    out_path = os.path.abspath(args.out)
+    interval_str = args.interval or "5s"
+    quality = args.quality
+    skip_identical = not args.no_skip_identical
+
+    # Parse interval: "5s", "10s", "1m", "30" (assume seconds)
+    interval_str = interval_str.strip().lower()
+    if interval_str.endswith("s"):
+        interval_s = float(interval_str[:-1])
+    elif interval_str.endswith("m"):
+        interval_s = float(interval_str[:-1]) * 60
+    else:
+        interval_s = float(interval_str)
+
+    if interval_s < 1:
+        print_error("INVALID_INTERVAL", f"Interval must be >= 1s (got {interval_s}s)")
+
+    # Validate session
+    sess = SessionRegistry.get(session_id)
+    if not sess:
+        print_error("SESSION_NOT_FOUND", f"Session {session_id} not found. Run 'headless list' to see active sessions.")
+
+    display = sess["display"]
+
+    # Check if monitor already running
+    if _monitor_is_alive(session_id):
+        existing_pid = _monitor_get_pid(session_id)
+        print_error("MONITOR_ALREADY_RUNNING",
+                    f"Monitor for session {session_id} is already running (PID {existing_pid}). Use 'monitor stop' first.")
+
+    # Validate output path
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.isdir(out_dir):
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            print_error("INVALID_OUT_PATH", f"Cannot create output directory {out_dir}: {e}")
+
+    # Write the worker script (idempotent — overwrites if changed)
+    with open(MONITOR_SCRIPT_PATH, "w") as f:
+        f.write(_monitor_worker_script())
+    os.chmod(MONITOR_SCRIPT_PATH, 0o755)
+
+    # Build environment for the worker
+    env = os.environ.copy()
+    env["MONITOR_SESSION_ID"] = session_id
+    env["MONITOR_DISPLAY"] = display
+    env["MONITOR_OUT_PATH"] = out_path
+    env["MONITOR_INTERVAL_S"] = str(interval_s)
+    env["MONITOR_QUALITY"] = str(quality) if quality is not None else ""
+    env["MONITOR_SKIP_IDENTICAL"] = "1" if skip_identical else "0"
+    env["MONITOR_CACHE_DIR"] = CACHE_DIR
+
+    # Spawn worker as detached subprocess (new session, no parent inheritance)
+    log_fd = open(_monitor_log_file(session_id), "a")
+    log_fd.write(f"\n[{iso_now()}] === Spawning monitor for {session_id} ===\n")
+    log_fd.flush()
+
+    proc = subprocess.Popen(
+        [sys.executable, MONITOR_SCRIPT_PATH],
+        env=env,
+        stdout=log_fd,
+        stderr=log_fd,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,  # detach from parent
+    )
+
+    # Write PID file
+    with open(_monitor_pid_file(session_id), "w") as f:
+        f.write(str(proc.pid))
+
+    # Write initial state
+    _monitor_write_state(session_id, {
+        "pid": proc.pid,
+        "session_id": session_id,
+        "display": display,
+        "out_path": out_path,
+        "interval_s": interval_s,
+        "quality": quality,
+        "skip_identical": skip_identical,
+        "started_at": iso_now(),
+        "last_frame_at": None,
+        "frames_captured": 0,
+        "frames_skipped": 0,
+        "last_hash": None,
+        "running": True,
+        "status": "starting",
+    })
+
+    # Wait briefly to ensure worker started OK
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        # Worker exited immediately — read state
+        state = _monitor_read_state(session_id) or {}
+        err = state.get("error", "worker exited immediately")
+        print_error("MONITOR_START_FAILED", f"Monitor worker failed to start: {err}")
+
+    print_json({
+        "status": "ok",
+        "session_id": session_id,
+        "monitor_pid": proc.pid,
+        "display": display,
+        "out_path": out_path,
+        "interval_s": interval_s,
+        "quality": quality,
+        "skip_identical": skip_identical,
+        "state_file": _monitor_state_file(session_id),
+        "log_file": _monitor_log_file(session_id),
+        "message": f"Monitor started. Live screenshots will be written to {out_path} every {interval_s}s."
+    })
+
+
+def _monitor_stop(args):
+    """Stop a monitor (or all monitors)."""
+    session_id = args.session
+
+    if session_id:
+        sessions_to_stop = [session_id]
+    else:
+        # Stop all
+        sessions_to_stop = []
+        for f in os.listdir(MONITOR_DIR):
+            if f.startswith("monitor-") and f.endswith(".pid"):
+                sessions_to_stop.append(f[len("monitor-"):-len(".pid")])
+
+    if not sessions_to_stop:
+        print_json({"status": "ok", "stopped": [], "total": 0, "message": "No monitors running."})
+        return
+
+    stopped = []
+    for sid in sessions_to_stop:
+        if not _monitor_is_alive(sid):
+            # Stale — just clean up files
+            try:
+                os.unlink(_monitor_pid_file(sid))
+            except Exception:
+                pass
+            state = _monitor_read_state(sid) or {}
+            state["running"] = False
+            state["status"] = "stopped_stale"
+            _monitor_write_state(sid, state)
+            stopped.append({"session_id": sid, "pid": None, "frames_captured": state.get("frames_captured", 0), "stale": True})
+            continue
+
+        pid = _monitor_get_pid(sid)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        # Wait up to 5s for graceful shutdown
+        for _ in range(50):
+            if not os.path.exists(f"/proc/{pid}"):
+                break
+            time.sleep(0.1)
+        else:
+            # Force kill
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+        # Cleanup PID file
+        try:
+            os.unlink(_monitor_pid_file(sid))
+        except Exception:
+            pass
+
+        state = _monitor_read_state(sid) or {}
+        state["running"] = False
+        state["status"] = "stopped"
+        state["ended_at"] = iso_now()
+        _monitor_write_state(sid, state)
+
+        stopped.append({
+            "session_id": sid,
+            "pid": pid,
+            "frames_captured": state.get("frames_captured", 0),
+            "frames_skipped": state.get("frames_skipped", 0),
+        })
+
+    print_json({
+        "status": "ok",
+        "stopped": stopped,
+        "total": len(stopped),
+        "message": f"Stopped {len(stopped)} monitor(s)."
+    })
+
+
+def _monitor_status(args):
+    """List all monitors with their state."""
+    monitors = []
+    for f in sorted(os.listdir(MONITOR_DIR)):
+        if not (f.startswith("monitor-") and f.endswith(".state")):
+            continue
+        sid = f[len("monitor-"):-len(".state")]
+        state = _monitor_read_state(sid) or {}
+        alive = _monitor_is_alive(sid)
+        # Cross-check session liveness
+        sess = SessionRegistry.get(sid)
+        session_alive = bool(sess) and os.path.exists(f"/proc/{sess.get('pid', 0)}")
+        monitors.append({
+            "session_id": sid,
+            "monitor_pid": state.get("pid"),
+            "monitor_alive": alive,
+            "session_alive": session_alive,
+            "display": state.get("display"),
+            "out_path": state.get("out_path"),
+            "interval_s": state.get("interval_s"),
+            "quality": state.get("quality"),
+            "skip_identical": state.get("skip_identical"),
+            "started_at": state.get("started_at"),
+            "last_frame_at": state.get("last_frame_at"),
+            "frames_captured": state.get("frames_captured", 0),
+            "frames_skipped": state.get("frames_skipped", 0),
+            "status": state.get("status", "unknown"),
+        })
+
+    print_json({
+        "status": "ok",
+        "total": len(monitors),
+        "active": sum(1 for m in monitors if m["monitor_alive"]),
+        "monitors": monitors,
+    })
+
+
 def cmd_clipboard(args):
     display = _resolve_display(args, required_session=False)
     env = os.environ.copy()
@@ -3584,6 +4157,57 @@ def main():
         epilog='Example:\n  headless list\n  → {"status":"ok","sessions":[{"session_id":"sess_...","pid":1234,"state":"running",...}]}',
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
+    # Command: monitor (live screen capture daemon — opt-in, agent must explicitly start)
+    parser_monitor = subparsers.add_parser("monitor",
+        help="Live screen capture daemon — explicit start/stop (opt-in)",
+        description=(
+            "Spawn a detached subprocess that captures a session's X11 display every N "
+            "seconds and atomically writes the latest PNG to a fixed path. OPT-IN: must "
+            "be explicitly started by the agent — never runs automatically. Useful for "
+            "live monitoring of what a Windows app is showing without invoking "
+            "'headless screenshot' on every check."
+        ),
+        epilog=(
+            'Examples:\n'
+            '  headless monitor start --session sess_... --out /tmp/live.png\n'
+            '  → {"status":"ok","monitor_pid":12345,"out_path":"/tmp/live.png","interval_s":5.0,...}\n\n'
+            '  headless monitor start --session sess_... --out /tmp/live.png --interval 2s --quality 85\n'
+            '  (use JPEG with quality 85 instead of PNG, every 2s)\n\n'
+            '  headless monitor stop --session sess_...\n'
+            '  → {"status":"ok","stopped":[{"session_id":"sess_...","frames_captured":42,...}]}\n\n'
+            '  headless monitor stop\n'
+            '  (stops ALL monitors)\n\n'
+            '  headless monitor status\n'
+            '  → {"status":"ok","total":1,"active":1,"monitors":[{...}]}'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_monitor_sub = parser_monitor.add_subparsers(
+        dest="monitor_subcommand", metavar="subcommand", required=True)
+
+    parser_monitor_start = parser_monitor_sub.add_parser("start",
+        help="Start a monitor for a session",
+        description="Start a detached monitor subprocess that captures the session's display every N seconds.")
+    parser_monitor_start.add_argument("--session", required=True,
+        help="Session ID to monitor (must be active)")
+    parser_monitor_start.add_argument("--out", required=True,
+        help="Output path for the live PNG (absolute path recommended)")
+    parser_monitor_start.add_argument("--interval", default="5s",
+        help="Capture interval: '5s', '10s', '1m', or '30' (assumes seconds). Default: 5s")
+    parser_monitor_start.add_argument("--quality", type=int, default=None,
+        help="If set, output JPEG with this quality (1-100) instead of PNG lossless")
+    parser_monitor_start.add_argument("--no-skip-identical", action="store_true",
+        help="Disable skipping of frames whose downscale hash matches previous (default: skip)")
+
+    parser_monitor_stop = parser_monitor_sub.add_parser("stop",
+        help="Stop one or all monitors",
+        description="Stop a monitor by session ID, or all monitors if no session is specified.")
+    parser_monitor_stop.add_argument("--session", default=None,
+        help="Session ID to stop (if omitted, stops ALL monitors)")
+
+    parser_monitor_status = parser_monitor_sub.add_parser("status",
+        help="List all monitors and their state",
+        description="List all monitor subprocesses (active and recently stopped).")
+
     args = parser.parse_args()
 
     if args.verify:
@@ -3621,7 +4245,8 @@ def main():
         "metrics": cmd_metrics,
         "file-read": cmd_file_read,
         "file-write": cmd_file_write,
-        "diff": cmd_diff
+        "diff": cmd_diff,
+        "monitor": cmd_monitor
     }
 
     try:
