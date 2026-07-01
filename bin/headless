@@ -865,11 +865,17 @@ def cmd_exec(args):
     # Also bind the CWD so Wine can chdir to it (Wine needs the working directory)
     cwd = os.getcwd()
     cwd_bind = ["--bind", cwd, cwd] if os.path.exists(cwd) else []
-    # PATCH: Add --chdir to set working directory to the EXE's folder.
-    # Many Windows games (MBAA.exe included) use relative paths to load data
-    # files (0000.p, 0001.p, ...). Without this, the game shows
-    # "Failed to load data Files" when run from a different cwd.
-    if exe_dir and os.path.exists(exe_dir):
+    # LIMITATION-003: --chdir sets working directory to the EXE's folder by
+    # default (many games load data via relative paths). The --cwd flag
+    # allows the caller to override this with a custom working directory.
+    custom_cwd = getattr(args, 'cwd', None)
+    if custom_cwd:
+        if not os.path.exists(custom_cwd):
+            print_error("CWD_NOT_FOUND", f"Custom working directory does not exist: {custom_cwd}")
+        # Bind the custom cwd so bwrap can chdir to it
+        cwd_bind = cwd_bind + ["--bind", custom_cwd, custom_cwd]
+        chdir_arg = ["--chdir", custom_cwd]
+    elif exe_dir and os.path.exists(exe_dir):
         chdir_arg = ["--chdir", exe_dir]
     else:
         chdir_arg = []
@@ -1600,6 +1606,140 @@ def _ocr_find_text_in_buttons(screenshot_path, target_text, fuzzy=False):
                 })
 
     return matches
+
+
+def cmd_find_text(args):
+    """Find all occurrences of text on screen via OCR. Like click-text but
+    returns all matches without clicking. Uses the same 3-tier fallback:
+    1. Full-screen OCR (PSM 11)
+    2. 2x upscale + retry
+    3. Color-based button detection + per-button OCR
+    """
+    target_text = args.text
+    fuzzy = getattr(args, "fuzzy", False)
+
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    # Take a screenshot
+    screenshot_path = f"/tmp/find_text_{int(time.time())}.png"
+    import_bin = shutil.which("import")
+    if import_bin:
+        try:
+            subprocess.run([import_bin, "-window", "root", screenshot_path],
+                          env=env, check=True, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print_error("SCREENSHOT_FAILED", f"Could not capture screen for OCR: {e}")
+    else:
+        print_error("SCREENSHOT_FAILED", "ImageMagick 'import' not found")
+
+    all_matches = []
+
+    # Strategy 1: Full-screen OCR
+    matches = _ocr_find_text(screenshot_path, target_text, fuzzy=fuzzy)
+    for m in matches:
+        m["method"] = "ocr"
+        all_matches.append(m)
+
+    # Strategy 2: Upscale 2x and retry (only if strategy 1 found nothing)
+    if not all_matches:
+        try:
+            from PIL import Image
+            img = Image.open(screenshot_path).convert("RGB")
+            img_big = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+            big_path = screenshot_path.replace(".png", "_2x.png")
+            img_big.save(big_path)
+            big_matches = _ocr_find_text(big_path, target_text, fuzzy=fuzzy)
+            for m in big_matches:
+                m["x"] //= 2
+                m["y"] //= 2
+                m["left"] //= 2
+                m["top"] //= 2
+                m["width"] //= 2
+                m["height"] //= 2
+                m["method"] = "ocr_2x"
+                all_matches.append(m)
+            try:
+                os.remove(big_path)
+            except Exception:
+                pass
+        except ImportError:
+            pass
+
+    # Strategy 3: Color-based button detection (always run to find buttons
+    # that full-screen OCR missed, even if strategy 1/2 found something)
+    btn_matches = _ocr_find_text_in_buttons(screenshot_path, target_text, fuzzy=fuzzy)
+    for m in btn_matches:
+        all_matches.append(m)
+
+    # Clean up screenshot
+    try:
+        os.remove(screenshot_path)
+    except Exception:
+        pass
+
+    # Deduplicate matches by (x, y) — strategy 1 and 3 might find the same button
+    seen = set()
+    unique_matches = []
+    for m in all_matches:
+        key = (m["x"], m["y"])
+        if key not in seen:
+            seen.add(key)
+            unique_matches.append(m)
+
+    print_json({
+        "status": "ok",
+        "text": target_text,
+        "matches": unique_matches,
+        "count": len(unique_matches)
+    })
+
+
+def cmd_find_buttons(args):
+    """Find all button-like regions on screen via color detection.
+    Returns each button's bounding box, dominant color, and OCR'd text.
+    Does not search for specific text — lists all detected buttons.
+    """
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    # Take a screenshot
+    screenshot_path = f"/tmp/find_buttons_{int(time.time())}.png"
+    import_bin = shutil.which("import")
+    if import_bin:
+        try:
+            subprocess.run([import_bin, "-window", "root", screenshot_path],
+                          env=env, check=True, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print_error("SCREENSHOT_FAILED", f"Could not capture screen: {e}")
+    else:
+        print_error("SCREENSHOT_FAILED", "ImageMagick 'import' not found")
+
+    # Use the button detection logic with an empty target (match all)
+    # We call _ocr_find_text_in_buttons with target="" and fuzzy=True so
+    # every button is "matched" (empty string is substring of everything).
+    buttons = _ocr_find_text_in_buttons(screenshot_path, "", fuzzy=True)
+
+    # Clean up screenshot
+    try:
+        os.remove(screenshot_path)
+    except Exception:
+        pass
+
+    # Remove the empty "text" field and rename for clarity
+    for b in buttons:
+        if not b.get("text"):
+            b["text"] = ""
+
+    print_json({
+        "status": "ok",
+        "buttons": buttons,
+        "count": len(buttons)
+    })
 
 
 def cmd_click_text(args):
@@ -2446,6 +2586,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser_exec.add_argument("exe_path", help="Path to the Windows .exe (Unix path or Windows C:\\\\... path)")
     parser_exec.add_argument("--display", help="X11 display to use (default: auto-detected from active sessions)")
+    parser_exec.add_argument("--cwd", help="Custom working directory inside the sandbox (default: EXE's directory). Useful for apps that need a different cwd than the EXE's location.")
     parser_exec.add_argument("--wait", action="store_true",
         help="Block until a window appears or the process dies. Combines exec + wait-window in one call. Returns PROCESS_DIED if the app crashes, or {\"status\":\"ok\",\"window\":{...},\"elapsed_ms\":N} if a window stabilizes.")
     parser_exec.add_argument("--timeout", type=int, default=30000,
@@ -2496,6 +2637,27 @@ def main():
         help="Partial match: target is substring of detected text or vice versa")
     parser_click_text.add_argument("--dry-run", action="store_true",
         help="Find text and return coordinates without clicking")
+
+    # Command: find-text
+    parser_find_text = subparsers.add_parser("find-text",
+        help="Find all occurrences of text on screen via OCR (no click)",
+        description="Capture a screenshot, run OCR (tesseract) to find all occurrences of the target text, and return their bounding boxes. Uses the same 3-tier fallback as click-text: full-screen OCR, 2x upscale, color-based button detection. Does NOT click.",
+        epilog='Examples:\n  headless find-text "Training" --session sess_...\n  headless find-text "OK" --session sess_... --fuzzy\n  → {"status":"ok","text":"Training","matches":[{"text":"Training","x":207,"y":232,...}],"count":1}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_find_text.add_argument("text", help="Text to find (case-insensitive)")
+    parser_find_text.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_find_text.add_argument("--display", help="X11 display (alternative to --session)")
+    parser_find_text.add_argument("--fuzzy", action="store_true",
+        help="Partial match: target is substring of detected text or vice versa")
+
+    # Command: find-buttons
+    parser_find_buttons = subparsers.add_parser("find-buttons",
+        help="Find all button-like regions on screen via color detection",
+        description="Capture a screenshot, detect colored rectangular regions (buttons), and return each button's bounding box, dominant color, and OCR'd text. Does NOT click.",
+        epilog='Example:\n  headless find-buttons --session sess_...\n  → {"status":"ok","buttons":[{"text":"Training","x":1219,"y":537,"width":280,"height":44,"button_color":[191,56,43]}],"count":1}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_find_buttons.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_find_buttons.add_argument("--display", help="X11 display (alternative to --session)")
 
     # Command: key
     parser_key = subparsers.add_parser("key",
@@ -2597,6 +2759,8 @@ def main():
         "screenshot": cmd_screenshot,
         "click": cmd_click,
         "click-text": cmd_click_text,
+        "find-text": cmd_find_text,
+        "find-buttons": cmd_find_buttons,
         "key": cmd_key,
         "type": cmd_type,
         "logs": cmd_logs,

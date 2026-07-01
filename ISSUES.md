@@ -235,17 +235,24 @@ Validated with test image: "Training" found via strategy 1 (conf 96%),
 
 **Priority**: P2
 **Component**: `bin/headless` → new commands
-**Status**: Open
+**Resolved in**: v1.2.0 (commit pending)
 
 **Summary**: No way to ask "where on screen is text X?" or "where are the
 buttons?" without clicking. Forces agents to reinvent OCR and color
 segmentation.
 
-**Expected behavior**:
-- `headless find-text "Training" --session <sess>` → returns all matches
-  with bounding boxes
-- `headless find-buttons --session <sess>` → returns button regions with
-  colors and OCR'd text
+**Fix**: Added two new commands:
+- `headless find-text "<text>" --session <sess>` — finds all occurrences of
+  text via the same 3-tier OCR fallback as click-text (full-screen OCR,
+  2x upscale, color-based button detection). Returns all matches with
+  bounding boxes, confidence, and method. Supports `--fuzzy`.
+- `headless find-buttons --session <sess>` — finds all colored button
+  regions via color detection, returns each with bounding box, dominant
+  color, and OCR'd text.
+
+Validated: find-text "Training" returns 1 OCR match; find-text "e" fuzzy
+returns 5 matches (3 OCR + 2 button_color); find-buttons returns 2 red
+buttons ("Host Game" and "Join Game").
 
 ---
 
@@ -253,14 +260,18 @@ segmentation.
 
 **Priority**: P2
 **Component**: `bin/headless` → `cmd_exec`
-**Status**: Partially fixed (auto `--chdir` to exe_dir, but no override flag)
+**Resolved in**: v1.2.0 (commit pending)
 
 **Summary**: `headless exec` automatically sets `--chdir <exe_dir>` in
 bwrap (fixed in commit `d13d12b`), but there's no `--cwd` flag for callers
 who need a different working directory.
 
-**Expected behavior**: `headless exec --cwd /custom/path app.exe` to
-override the default exe_dir behavior.
+**Fix**: Added `--cwd <path>` flag to `headless exec`. When set, the bwrap
+sandbox chdirs to the custom path instead of the EXE's directory. The
+custom path is also bind-mounted so it's accessible inside the sandbox.
+Returns `CWD_NOT_FOUND` error if the path doesn't exist.
+
+Example: `headless exec --cwd /path/to/data app.exe`
 
 ---
 
