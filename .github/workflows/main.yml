@@ -22,6 +22,7 @@ jobs:
           sudo apt-get install -y -qq \
             xvfb openbox xdotool wmctrl x11-utils xclip imagemagick \
             libx11-6 libvulkan1 \
+            libegl1 libgl1 libglx-mesa0 libgl1-mesa-dri \
             bubblewrap curl patchelf \
             binutils-mingw-w64-i686 gcc-mingw-w64-i686-win32 g++-mingw-w64-i686-win32 \
             binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64-win32 g++-mingw-w64-x86-64-win32 \
@@ -74,6 +75,21 @@ jobs:
           # Install bwrap into prefix (WineHQ doesn't bundle it)
           mkdir -p "$PREFIX/usr/bin"
           cp /usr/bin/bwrap "$PREFIX/usr/bin/bwrap"
+
+          # Bundle libEGL.so.1 into the Wine lib directory.
+          # Wine's wgl driver tries EGL first and prints a noisy error when
+          # libEGL.so.1 is absent (it falls back to GLX, but the error scares
+          # users and may break some OpenGL apps that prefer EGL).
+          # The path /opt/wine-devel/lib/wine/x86_64-unix/extra is added to
+          # LD_LIBRARY_PATH by bin/headless so the dynamic loader finds it.
+          EGL_DEST="$PREFIX/opt/wine-devel/lib/wine/x86_64-unix/extra"
+          mkdir -p "$EGL_DEST"
+          if [ -f /usr/lib/x86_64-linux-gnu/libEGL.so.1 ]; then
+            cp -L /usr/lib/x86_64-linux-gnu/libEGL.so.1 "$EGL_DEST/libEGL.so.1"
+            echo "[build] Bundled libEGL.so.1 -> $EGL_DEST"
+          else
+            echo "[build] WARNING: libEGL.so.1 not found on build host; EGL will be unavailable at runtime"
+          fi
 
       - name: Build rootfs
         run: |

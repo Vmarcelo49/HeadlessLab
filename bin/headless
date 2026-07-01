@@ -133,6 +133,36 @@ def detect_pe_arch(exe_path):
         return "unknown"
 
 
+
+
+def detect_pe_subsystem(exe_path):
+    """Detect the PE subsystem of a Windows binary.
+    Returns 2 (GUI), 3 (Console), or 0 (unknown).
+    Used to decide whether to use 'wine' (GUI) or 'wineconsole' (console)."""
+    try:
+        with open(exe_path, "rb") as f:
+            if f.read(2) != b"MZ":
+                return 0
+            f.seek(0x3C)
+            pe_offset = int.from_bytes(f.read(4), "little")
+            f.seek(pe_offset)
+            # PE signature: 0x50 0x45 0x00 0x00
+            sig = f.read(4)
+            if sig != b"PE" + b"\x00" + b"\x00":
+                return 0
+            # Skip COFF header (20 bytes) + Magic (2 bytes)
+            f.seek(pe_offset + 4 + 20)
+            magic = int.from_bytes(f.read(2), "little")
+            if magic == 0x10B or magic == 0x20B:  # PE32 or PE32+
+                # Subsystem is at offset 68 in Optional Header
+                f.seek(pe_offset + 4 + 20 + 68)
+            else:
+                return 0
+            return int.from_bytes(f.read(2), "little")
+    except Exception:
+        return 0
+
+
 def get_wine_binary():
     """Return the Wine binary path INSIDE the bwrap sandbox.
     Wine 11 from WineHQ installs to /opt/wine-devel/ with hardcoded paths.
@@ -408,7 +438,7 @@ def cmd_exec(args):
     env = os.environ.copy()
     env["DISPLAY"] = display
     env["WINEPREFIX"] = wineprefix
-    env["LD_LIBRARY_PATH"] = "/opt/wine-devel/lib/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/usr/lib"
+    env["LD_LIBRARY_PATH"] = "/opt/wine-devel/lib/wine/x86_64-unix:/opt/wine-devel/lib/wine/x86_64-unix/extra:/usr/lib/x86_64-linux-gnu:/usr/lib"
     env["VK_ICD_FILENAMES"] = "/usr/share/vulkan/icd.d/lvp_icd.json"
     env["WINEDEBUG"] = "-all"
     env["PATH"] = "/opt/wine-devel/bin:/usr/bin:/bin"
@@ -535,24 +565,68 @@ def cmd_exec(args):
 
     exe_dir = os.path.dirname(exe_path) if not windows_path else None
 
+    # Detect PE subsystem to decide between wine and wineconsole
+    if windows_path:
+        pe_subsystem = 0  # unknown
+    else:
+        pe_subsystem = detect_pe_subsystem(exe_path)
+
+    # For console-subsystem apps (pe_subsystem == 3), Wine's plain 'wine' will
+    # create a Unix-side console and forward the app's stdout/stderr to it.
+    # We use plain wine (not wineconsole) because wineconsole --backend=curses
+    # requires a real tty (not available under bwrap), and --backend=user opens
+    # a GUI console window whose contents we cannot easily capture.
+    # Set HEADLESS_USE_WINECONSOLE=1 to force wineconsole --backend=user if you
+    # need to interact with the console window visually.
+    if pe_subsystem == 3 and os.environ.get("HEADLESS_USE_WINECONSOLE") == "1":
+        actual_wine_binary = "/opt/wine-devel/bin/wineconsole"
+        wine_args = ["--backend=user", "--", wine_binary]
+    else:
+        actual_wine_binary = wine_binary
+        wine_args = []
+
     # Re-build BWRAP arguments to include user exe path binding (only for host paths)
     # Also bind the CWD so Wine can chdir to it (Wine needs the working directory)
     cwd = os.getcwd()
     cwd_bind = ["--bind", cwd, cwd] if os.path.exists(cwd) else []
-    if windows_path:
-        # Pass the Windows path as-is to Wine — Wine resolves it inside the sandbox
-        bwrap_run = bwrap_base + cwd_bind + [
-            wine_binary, windows_path
-        ] + args.args
+    # PATCH: Add --chdir to set working directory to the EXE's folder.
+    # Many Windows games (MBAA.exe included) use relative paths to load data
+    # files (0000.p, 0001.p, ...). Without this, the game shows
+    # "Failed to load data Files" when run from a different cwd.
+    if exe_dir and os.path.exists(exe_dir):
+        chdir_arg = ["--chdir", exe_dir]
     else:
-        bwrap_run = bwrap_base + cwd_bind + [
+        chdir_arg = []
+    if windows_path:
+        bwrap_run = bwrap_base + cwd_bind + chdir_arg + [
+            actual_wine_binary
+        ] + wine_args + [windows_path] + args.args
+    else:
+        bwrap_run = bwrap_base + cwd_bind + chdir_arg + [
             "--bind", exe_dir, exe_dir,
-            wine_binary, exe_path
-        ] + args.args
+            actual_wine_binary
+        ] + wine_args + [exe_path] + args.args
 
     # Capture logs: redirect BOTH stdout and stderr of the EXE to the log file
     # (previously stdout went to /dev/null, hiding the EXE's own printf output)
-    env["WINEDEBUG"] = "-all,+debugstr"
+    env["WINEDEBUG"] = os.environ.get("HEADLESS_WINEDEBUG", "-all,+debugstr")
+
+    # PATCH: Apply DLL overrides from HEADLESS_DLL_OVERRIDES env var.
+    # Format: "d3dx9_36=native,builtin;d3dx9_43=native,builtin"
+    # Useful when the game ships native DLLs that should override Wine's
+    # builtin versions.
+    dll_overrides = os.environ.get("HEADLESS_DLL_OVERRIDES", "")
+    if dll_overrides:
+        existing = env.get("WINEDLLOVERRIDES", "")
+        for override in dll_overrides.split(";"):
+            override = override.strip()
+            if "=" in override:
+                dll, mode = override.split("=", 1)
+                if existing:
+                    existing = existing + ";"
+                existing = existing + f"{dll}={mode}"
+        env["WINEDLLOVERRIDES"] = existing
+
     log_file = open(log_path, "w")
     try:
         proc = subprocess.Popen(
@@ -600,7 +674,7 @@ def cmd_exec(args):
     SessionRegistry.register(session_id, root_pid, display, wineprefix, log_path)
 
     # Report architecture so the agent knows whether the EXE ran as 32-bit or 64-bit
-    print_json({"status": "ok", "session_id": session_id, "pid": root_pid, "arch": pe_arch})
+    print_json({"status": "ok", "session_id": session_id, "pid": root_pid, "arch": pe_arch, "subsystem": pe_subsystem})
 
 
 def _resolve_display(args, required_session=False):
@@ -673,6 +747,30 @@ def cmd_screenshot(args):
         sessions = SessionRegistry.list_all()
         if sessions:
             display = list(sessions.values())[0]["display"]
+
+    # PATCH: Emit a one-time-per-session warning to stderr reminding agents
+    # that processes may take time to actually open and render anything visible.
+    # This is printed to stderr so it does not corrupt the JSON on stdout.
+    # The warning is shown only once per session via a flag file in the
+    # session cache directory; set HEADLESS_NO_WAIT_WARNING=1 to suppress.
+    if os.environ.get("HEADLESS_NO_WAIT_WARNING") != "1":
+        try:
+            if session_id:
+                flag_path = os.path.join(CACHE_DIR, session_id, ".screenshot_wait_warning_shown")
+            else:
+                flag_path = os.path.join(CACHE_DIR, ".screenshot_wait_warning_shown")
+            if not os.path.exists(flag_path):
+                sys.stderr.write(
+                    "[headless] Remember: processes may take some time to "
+                    "actually open and render anything visible. If the "
+                    "screenshot looks blank, wait a few seconds and try "
+                    "again (use `headless wait-window <sess>` first).\n"
+                )
+                sys.stderr.flush()
+                os.makedirs(os.path.dirname(flag_path), exist_ok=True)
+                open(flag_path, "w").close()
+        except Exception:
+            pass
 
     if not out_path:
         out_path = f"/tmp/screenshot_{int(time.time())}.png"
