@@ -370,25 +370,90 @@ def get_pids_for_prefix(wineprefix):
             continue
     return pids
 
-def get_windows_for_session(display, session_pids):
+def get_windows_for_session(display, session_pids, exe_basename=None, session_created_at=None):
+    """List X11 windows belonging to a session.
+
+    Primary filter: window's _NET_WM_PID is in session_pids.
+    Fallback (BUG-007 fix): if no windows match by PID, also include windows
+    whose WM_CLASS matches exe_basename (e.g. "mbaa.exe"), or windows that
+    appeared after the session was created. This catches modal dialogs
+    (MessageBox, Error dialogs) whose _NET_WM_PID doesn't match the
+    wineprefix's PIDs.
+    """
     env = os.environ.copy()
     env["DISPLAY"] = display
     try:
         res = subprocess.run(["wmctrl", "-l", "-p"], env=env, capture_output=True, text=True)
-        # Use the rotating debug_log instead of an unbounded /tmp file
         debug_log(f"get_windows_for_session: session_pids={session_pids}")
         debug_log(f"get_windows_for_session: wmctrl output:\n{res.stdout}")
         if res.returncode != 0:
             return []
-        windows = []
+
+        # Parse all windows from wmctrl output
+        all_windows = []
         for line in res.stdout.splitlines():
             parts = line.split(None, 4)
             if len(parts) >= 4:
                 w_id = parts[0]
-                pid = int(parts[2])
+                # parts[2] is the PID (wmctrl -p format: id desktop pid title)
+                try:
+                    pid = int(parts[2])
+                except (ValueError, IndexError):
+                    pid = 0
                 title = parts[4] if len(parts) > 4 else ""
-                if pid in session_pids:
-                    windows.append({"id": w_id, "pid": pid, "title": title})
+                all_windows.append({"id": w_id, "pid": pid, "title": title})
+
+        # Primary filter: PID match
+        windows = [w for w in all_windows if w["pid"] in session_pids]
+        if windows:
+            return windows
+
+        # Fallback 1 (BUG-007): No windows matched by PID. This commonly
+        # happens with modal dialogs (MessageBox, Error dialogs) whose
+        # _NET_WM_PID doesn't match the wineprefix's process tree. Try
+        # matching by WM_CLASS against the EXE basename.
+        if exe_basename:
+            exe_lower = exe_basename.lower().replace(".exe", "")
+            for w in all_windows:
+                if w["pid"] and w["pid"] in session_pids:
+                    continue  # already checked
+                # Get WM_CLASS via xprop
+                try:
+                    xprop_res = subprocess.run(
+                        ["xprop", "-id", w["id"], "WM_CLASS"],
+                        env=env, capture_output=True, text=True, timeout=2
+                    )
+                    if xprop_res.returncode == 0:
+                        wm_class = xprop_res.stdout.lower()
+                        # WM_CLASS looks like: WM_CLASS(STRING) = "mbaa.exe", "mbaa.exe"
+                        if exe_lower in wm_class:
+                            w["matched_by"] = "wm_class"
+                            windows.append(w)
+                            continue
+                except Exception:
+                    pass
+
+        if windows:
+            return windows
+
+        # Fallback 2: If we still have no windows but there ARE windows on
+        # the display, and the session was created recently, include any
+        # window whose title looks like an error/dialog. This is a last
+        # resort to catch Wine's built-in dialogs ("Error", "Wine Mono
+        # Installer", "Program Error", "Wine Debugger").
+        if not windows and all_windows:
+            DIALOG_TITLES = (
+                "error", "wine", "program error", "wine debugger",
+                "wine mono installer", "unhandled", "exception",
+            )
+            for w in all_windows:
+                if w["pid"] and w["pid"] in session_pids:
+                    continue  # already checked
+                title_lower = w["title"].lower()
+                if any(dt in title_lower for dt in DIALOG_TITLES):
+                    w["matched_by"] = "dialog_title"
+                    windows.append(w)
+
         return windows
     except Exception as e:
         debug_log(f"get_windows_for_session exception: {e}")
@@ -1025,6 +1090,116 @@ def cmd_exec(args):
     # Write to registry
     SessionRegistry.register(session_id, root_pid, display, wineprefix, log_path)
 
+    # If --wait was requested, block until a window appears or the process
+    # dies. This combines exec + wait-window in one call, reducing agent
+    # round-trips and avoiding the "exec says ok but app is dead" trap.
+    # Returns an augmented JSON response with window info and elapsed_ms.
+    if getattr(args, 'wait', False):
+        wait_timeout_ms = getattr(args, 'timeout', 30000)
+        wait_start = time.time()
+        last_hash = None
+        stable_start = None
+        wait_env = os.environ.copy()
+        wait_env["DISPLAY"] = display
+
+        while (time.time() - wait_start) * 1000 < wait_timeout_ms:
+            # Check if process died (reuse BUG-002 logic)
+            prefix_pids = get_pids_for_prefix(wineprefix)
+            if not prefix_pids:
+                log_tail = ""
+                try:
+                    with open(log_path, "r", errors="ignore") as f:
+                        log_tail = f.read()[-2000:]
+                except Exception:
+                    pass
+                try:
+                    data = SessionRegistry._load()
+                    if session_id in data["sessions"]:
+                        data["sessions"][session_id]["state"] = "crashed"
+                        data["sessions"][session_id]["crash_reason"] = "no wine processes during --wait"
+                        SessionRegistry._save(data)
+                except Exception:
+                    pass
+                print_error(
+                    "PROCESS_DIED",
+                    f"Wine process exited during --wait (no wine processes under prefix). "
+                    f"Log tail (last 2000 chars):\n{log_tail}"
+                )
+            marker = log_shows_crash(log_path)
+            if marker:
+                user_pids = live_user_pids(prefix_pids)
+                if not user_pids:
+                    log_tail = ""
+                    try:
+                        with open(log_path, "r", errors="ignore") as f:
+                            log_tail = f.read()[-2000:]
+                    except Exception:
+                        pass
+                    try:
+                        data = SessionRegistry._load()
+                        if session_id in data["sessions"]:
+                            data["sessions"][session_id]["state"] = "crashed"
+                            data["sessions"][session_id]["crash_reason"] = f"log contains '{marker}'"
+                            SessionRegistry._save(data)
+                    except Exception:
+                        pass
+                    print_error(
+                        "PROCESS_DIED",
+                        f"Wine process crashed during --wait (log contains '{marker}'). "
+                        f"Log tail (last 2000 chars):\n{log_tail}"
+                    )
+
+            windows = get_windows_for_session(display, prefix_pids)
+            if windows:
+                w_id = windows[0]["id"]
+                tmp_path = f"/tmp/wait_w_{session_id}.png"
+                try:
+                    subprocess.run(["import", "-window", w_id, tmp_path], env=wait_env, check=True,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    with open(tmp_path, "rb") as f:
+                        current_hash = hashlib.md5(f.read()).hexdigest()
+                    if current_hash == last_hash:
+                        if not stable_start:
+                            stable_start = time.time()
+                        elif (time.time() - stable_start) >= 0.150:
+                            elapsed = int((time.time() - wait_start) * 1000)
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            print_json({
+                                "status": "ok",
+                                "session_id": session_id,
+                                "pid": root_pid,
+                                "arch": pe_arch,
+                                "subsystem": pe_subsystem,
+                                "window": windows[0],
+                                "elapsed_ms": elapsed
+                            })
+                            return
+                    else:
+                        last_hash = current_hash
+                        stable_start = None
+                except Exception:
+                    pass
+            else:
+                last_hash = None
+                stable_start = None
+            time.sleep(0.05)
+
+        # Timeout — window never stabilized
+        elapsed = int((time.time() - wait_start) * 1000)
+        print_json({
+            "status": "timeout",
+            "session_id": session_id,
+            "pid": root_pid,
+            "arch": pe_arch,
+            "subsystem": pe_subsystem,
+            "elapsed_ms": elapsed,
+            "message": "Window did not stabilize within timeout. Use 'headless wait-window' to continue waiting, or 'headless screenshot' to check current state."
+        })
+        sys.exit(2)
+
     # Report architecture so the agent knows whether the EXE ran as 32-bit or 64-bit
     print_json({"status": "ok", "session_id": session_id, "pid": root_pid, "arch": pe_arch, "subsystem": pe_subsystem})
 
@@ -1431,7 +1606,56 @@ def cmd_windows(args):
     env = os.environ.copy()
     env["DISPLAY"] = display
 
-    # Collect all PIDs belonging to all active sessions to map windows
+    # If --session is specified, use get_windows_for_session which has the
+    # BUG-007 fallback logic (WM_CLASS matching + dialog title matching).
+    # This catches modal dialogs whose _NET_WM_PID doesn't match the
+    # wineprefix's PIDs.
+    requested_session = getattr(args, 'session', None)
+    if requested_session:
+        sess = SessionRegistry.get(requested_session)
+        if not sess:
+            print_error("SESSION_NOT_FOUND", f"Session {requested_session} not found")
+        wineprefix = sess["wineprefix"]
+        prefix_pids = get_pids_for_prefix(wineprefix)
+        # Determine exe_basename from the session's cmdline (if available)
+        exe_basename = None
+        try:
+            with open(f"/proc/{sess['pid']}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            # Extract the .exe filename from the cmdline
+            import re as _re
+            m = _re.search(r'([A-Za-z0-9_-]+\.exe)', cmdline, _re.IGNORECASE)
+            if m:
+                exe_basename = m.group(1)
+        except Exception:
+            pass
+        windows_raw = get_windows_for_session(display, prefix_pids, exe_basename=exe_basename)
+        # Enrich with modal detection and session_id
+        windows = []
+        for w in windows_raw:
+            is_modal = False
+            try:
+                xprop_res = subprocess.run(
+                    ["xprop", "-id", w["id"], "_NET_WM_STATE", "_NET_WM_WINDOW_TYPE"],
+                    env=env, capture_output=True, text=True, timeout=2
+                )
+                if xprop_res.returncode == 0:
+                    if "_NET_WM_STATE_ABOVE" in xprop_res.stdout or "_NET_WM_WINDOW_TYPE_DIALOG" in xprop_res.stdout:
+                        is_modal = True
+            except Exception:
+                pass
+            windows.append({
+                "id": w["id"],
+                "pid": w.get("pid", 0),
+                "session_id": requested_session,
+                "title": w["title"],
+                "type": "modal" if is_modal else "normal",
+                "matched_by": w.get("matched_by", "pid")
+            })
+        print_json({"status": "ok", "windows": windows})
+        return
+
+    # No --session: list ALL windows across ALL sessions (original behavior)
     sessions = SessionRegistry.list_all()
     all_pids = []
     pid_to_session = {}
@@ -1454,15 +1678,24 @@ def cmd_windows(args):
             parts = line.split(None, 4)
             if len(parts) >= 4:
                 w_id = parts[0]
-                pid = int(parts[2])
+                try:
+                    pid = int(parts[2])
+                except (ValueError, IndexError):
+                    pid = 0
                 title = parts[4] if len(parts) > 4 else ""
 
                 # Check modal type using xprop
                 is_modal = False
-                xprop_res = subprocess.run(["xprop", "-id", w_id, "_NET_WM_STATE", "_NET_WM_WINDOW_TYPE"], env=env, capture_output=True, text=True)
-                if xprop_res.returncode == 0:
-                    if "_NET_WM_STATE_ABOVE" in xprop_res.stdout or "_NET_WM_WINDOW_TYPE_DIALOG" in xprop_res.stdout:
-                        is_modal = True
+                try:
+                    xprop_res = subprocess.run(
+                        ["xprop", "-id", w_id, "_NET_WM_STATE", "_NET_WM_WINDOW_TYPE"],
+                        env=env, capture_output=True, text=True, timeout=2
+                    )
+                    if xprop_res.returncode == 0:
+                        if "_NET_WM_STATE_ABOVE" in xprop_res.stdout or "_NET_WM_WINDOW_TYPE_DIALOG" in xprop_res.stdout:
+                            is_modal = True
+                except Exception:
+                    pass
 
                 session_id = pid_to_session.get(pid, "unknown")
                 windows.append({
@@ -1861,6 +2094,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser_exec.add_argument("exe_path", help="Path to the Windows .exe (Unix path or Windows C:\\\\... path)")
     parser_exec.add_argument("--display", help="X11 display to use (default: auto-detected from active sessions)")
+    parser_exec.add_argument("--wait", action="store_true",
+        help="Block until a window appears or the process dies. Combines exec + wait-window in one call. Returns PROCESS_DIED if the app crashes, or {\"status\":\"ok\",\"window\":{...},\"elapsed_ms\":N} if a window stabilizes.")
+    parser_exec.add_argument("--timeout", type=int, default=30000,
+        help="Timeout in milliseconds for --wait (default: 30000). Only used when --wait is set.")
     parser_exec.add_argument("args", nargs=argparse.REMAINDER, help="Extra arguments to pass to the .exe")
 
     # Command: screenshot

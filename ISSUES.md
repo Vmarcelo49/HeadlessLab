@@ -297,7 +297,19 @@ in a future AppImage variant for apps that genuinely need .NET/HTML rendering.
 
 ---
 
-## BUG-007 — `headless screenshot` returns success for blank/black captures
+
+### Status
+
+**Fixed** in v1.1.0. `get_windows_for_session` now has a 3-tier fallback strategy when no windows match by PID:
+1. **Primary**: filter by `_NET_WM_PID` in session_pids (original behavior)
+2. **Fallback 1**: match by `WM_CLASS` against the EXE basename (e.g. `mbaa.exe`). Uses `xprop -id <wid> WM_CLASS` to check each window.
+3. **Fallback 2**: match by dialog title against known Wine dialog titles (`Error`, `Wine`, `Program Error`, `Wine Debugger`, `Wine Mono Installer`, `Unhandled`, `Exception`).
+
+`cmd_windows --session <sess>` now uses `get_windows_for_session` with the EXE basename extracted from the session's cmdline. Each window in the response includes a `matched_by` field (`pid` / `wm_class` / `dialog_title`) so agents know how the match was made. Validated with crash_test.exe: Wine Debugger dialogs (whose PIDs don't match the wineprefix) are now listed via `matched_by: "dialog_title"`.
+
+---
+
+## LIMITATION-001 — `headless screenshot` returns success for blank/black captures
 
 **Priority**: P1
 **Component**: `bin/headless` → `cmd_screenshot`
@@ -350,6 +362,7 @@ print_json(response)
 **Priority**: P1
 **Component**: `bin/headless` → `cmd_windows` / `get_windows_for_session`
 **Affected versions**: v1.0.0
+**Resolved in**: v1.1.0 (commit pending)
 
 ### Summary
 
@@ -669,9 +682,22 @@ headless type-unicode "日本語" --session <sess>   # uses clipboard + paste
 
 ---
 
-## ENHANCEMENT-001 — `headless exec` should block until window or death (`--wait`)
+
+### Status
+
+**Fixed** in v1.1.0. Added `--wait` and `--timeout` flags to `headless exec`. When `--wait` is set, `cmd_exec` blocks after launching the EXE, polling for window stability (reusing the BUG-002 crash detection logic). Returns:
+- `{"status": "ok", "window": {...}, "elapsed_ms": N}` when a window stabilizes
+- `{"status": "error", "code": "PROCESS_DIED", ...}` if the process crashes during the wait
+- `{"status": "timeout", ...}` if no window stabilizes within `--timeout` ms
+
+This combines `exec` + `wait-window` in one call, reducing agent round-trips. Validated with zzcaster.exe (returns ok + window info in 684ms) and crash_test.exe (returns PROCESS_DIED immediately).
+
+---
+
+## ENHANCEMENT-002 — `headless exec` should block until window or death (`--wait`)
 
 **Priority**: P1
+**Resolved in**: v1.1.0 (commit pending)
 **Component**: `bin/headless` → `cmd_exec`
 **Affected versions**: v1.0.0
 
@@ -744,9 +770,25 @@ Each case should assert a non-blank screenshot and/or expected log output.
 
 ---
 
-## DOCS-001 — `docs/GUIDE_LLM.md` lacks troubleshooting for silent failures
+
+### Status
+
+**Fixed** in v1.1.0. Added a comprehensive "Troubleshooting Silent Failures" section to `docs/GUIDE_LLM.md` with 6 decision trees:
+1. "exec returned ok but the app is not visible"
+2. "screenshot is all black / blank"
+3. "headless logs returns empty string"
+4. "CoCreateInstance returned REGDB_E_CLASSNOTREG"
+5. "Wine Mono Installer dialog appears and hangs"
+6. "App shows 'Failed to load data files' error"
+
+Plus a general debugging checklist with 7 ordered steps. Each decision tree covers the silent failure modes that agents are most likely to encounter, with concrete commands to diagnose and fix.
+
+---
+
+## DOCS-002 — `docs/GUIDE_LLM.md` lacks troubleshooting for silent failures
 
 **Priority**: P1
+**Resolved in**: v1.1.0 (commit pending)
 **Component**: `docs/GUIDE_LLM.md`
 **Affected versions**: v1.0.0
 

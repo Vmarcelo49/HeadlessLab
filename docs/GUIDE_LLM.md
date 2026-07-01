@@ -373,6 +373,178 @@ n = len(colors) if colors else 0
 
 ---
 
+## 🚨 Troubleshooting Silent Failures
+
+The most dangerous bugs are those where the CLI returns `{"status": "ok"}`
+but something is actually wrong. This section covers the silent failure
+modes that agents are most likely to encounter, with decision trees.
+
+### Decision Tree: "exec returned ok but the app is not visible"
+
+```
+headless exec app.exe → {"status": "ok", "session_id": "sess_xxx", ...}
+headless wait-window sess_xxx → ???
+```
+
+1. **If wait-window returns `{"status": "ok"}`**: The app opened a window.
+   Proceed to screenshot.
+
+2. **If wait-window returns `{"status": "timeout"}`**: The app is either
+   still loading OR it crashed. Check:
+   ```bash
+   headless list
+   ```
+   - If `state: "running"` → app may still be loading. Wait longer or
+     increase `--timeout`.
+   - If `state: "crashed"` → app crashed. Get the log:
+     ```bash
+     headless logs sess_xxx
+     ```
+   - If `state: "dead"` → process is gone. Check logs for crash markers.
+
+3. **If wait-window returns `{"status": "error", "code": "PROCESS_DIED"}`**:
+   The app crashed during startup. The `message` field contains the log
+   tail. Common causes:
+   - `Unhandled page fault` → the EXE itself crashed. Could be a missing
+     DLL, a COM class not registered, or a genuine game bug.
+   - `Application could not be started` → bwrap can't access the EXE, or
+     Wine can't load a required DLL. Check the EXE path and DLL overrides.
+   - `CoCreateInstance ... REGDB_E_CLASSNOTREG` → a COM class is missing
+     from the 32-bit registry view (Wow6432Node). See BUG-004 in ISSUES.md.
+
+### Decision Tree: "screenshot is all black / blank"
+
+```
+headless screenshot --session sess_xxx --out /tmp/x.png
+→ {"status": "ok", "path": "/tmp/x.png", "unique_colors": 1, "warning": "Screenshot appears blank..."}
+```
+
+1. **Check if the process is still alive**:
+   ```bash
+   headless list
+   ```
+   If `state: "dead"` or `state: "crashed"` → the app died before you
+   took the screenshot. Check `headless logs sess_xxx`.
+
+2. **If the process is alive but screenshot is blank**: The app may still
+   be rendering. Wait and retry:
+   ```bash
+   sleep 5
+   headless screenshot --session sess_xxx --out /tmp/x2.png
+   ```
+   If still blank after 10s, the app may be rendering to an offscreen
+   buffer or the display is wrong. Try `headless wait-window` first to
+   ensure pixel stability.
+
+3. **If `unique_colors` is between 2 and 10**: Could be a dialog (white
+   background + black text). OCR the screenshot to check for error
+   messages. The app may have shown a modal that's blocking rendering.
+
+### Decision Tree: "headless logs returns empty string"
+
+```
+headless logs sess_xxx → {"status": "ok", "logs": ""}
+```
+
+1. **Check the default WINEDEBUG**: As of v1.1.0, the default is
+   `warn+heap,err+all`. If logs are empty, the app produced no warnings
+   or errors — it may be running fine, or the crash happened in a code
+   path that doesn't log.
+
+2. **Enable verbose tracing**:
+   ```bash
+   headless kill sess_xxx
+   HEADLESS_WINEDEBUG="+relay,+seh" headless exec app.exe
+   ```
+   Warning: `+relay` produces gigabytes of output. Use targeted channels:
+   - `+d3d9,+d3d` for DirectX 9 issues
+   - `+ole` for COM/CoCreateInstance issues
+   - `+seh` for exception/crash analysis
+   - `+loaddll` for DLL loading failures
+
+3. **Check the raw log file directly**:
+   ```bash
+   cat /tmp/wine_debug_sess_xxx.log | tail -50
+   ```
+   The CLI's `logs` command decodes UTF-16 and applies line limits. The
+   raw file may contain content that was truncated.
+
+### Decision Tree: "CoCreateInstance returned REGDB_E_CLASSNOTREG"
+
+This means a COM class (CLSID) is not registered in the registry view
+that the app is querying. Common for 32-bit apps on Wine 11 PE-only WoW64.
+
+1. **Identify the missing CLSID**: The log will show something like:
+   ```
+   err:ole:com_get_class_object class {a65b8071-3bfe-4213-9a5b-491da4461ca7} not registered
+   ```
+
+2. **Check if the CLSID exists in the 64-bit view but not 32-bit**:
+   ```bash
+   grep -i "a65b8071" ~/.cache/headlesslab/wineprefix_template/system.reg
+   ```
+   If you see `Software\\Classes\\CLSID\\{...}` but not
+   `Software\\Classes\\Wow6432Node\\CLSID\\{...}`, the CLSID needs to be
+   mirrored to the 32-bit view.
+
+3. **The fix is automatic in v1.1.0+**: The `mirror_clsids_to_wow64()`
+   function runs during template creation and mirrors all 616+ CLSIDs.
+   If you're on an older version, delete the template to force recreation:
+   ```bash
+   rm -rf ~/.cache/headlesslab/wineprefix_template
+   headless exec app.exe  # will recreate template with mirrored CLSIDs
+   ```
+
+### Decision Tree: "Wine Mono Installer dialog appears and hangs"
+
+The AppImage doesn't bundle Wine Mono. When wineboot runs, it tries to
+install Mono and shows a dialog that never completes.
+
+1. **The fix is automatic in v1.1.0+**: Template creation sets
+   `WINEDLLOVERRIDES=mscoree=d;mshtml=d` to disable Mono, and creates
+   a `.update-timestamp` marker so sessions skip wineboot.
+
+2. **If you're on an older version or the dialog still appears**:
+   ```bash
+   headless kill sess_xxx
+   rm -rf ~/.cache/headlesslab/wineprefix_template
+   headless exec app.exe
+   ```
+   The new template will have Mono disabled.
+
+3. **If an app genuinely needs .NET/HTML rendering**: You'll need to
+   install Wine Mono manually by downloading the MSI from WineHQ and
+   placing it in `opt/wine-devel/share/wine/mono/`.
+
+### Decision Tree: "App shows 'Failed to load data files' error"
+
+The app uses relative paths to load data files (e.g. `0000.p`), but the
+current working directory inside the sandbox is wrong.
+
+1. **The fix is automatic in v1.1.0+**: `headless exec` adds `--chdir
+   <exe_dir>` to bwrap, setting the cwd to the EXE's folder.
+
+2. **If you're running bwrap manually**: Add `--chdir /path/to/exe_dir`
+   to your bwrap command.
+
+3. **If the app needs a different cwd**: Set it in the app's
+   configuration file (e.g. `_App.ini` for MBAA.exe) or use a wrapper
+   script.
+
+### General debugging checklist
+
+When something goes wrong, follow this order:
+
+1. `headless list` — check session state (`running` / `crashed` / `dead`)
+2. `headless logs <sess>` — get the Wine log (now non-empty by default)
+3. If logs are insufficient: `HEADLESS_WINEDEBUG="+seh,+loaddll" headless exec app.exe`
+4. `headless screenshot --session <sess>` — check `unique_colors` and `warning`
+5. If screenshot is blank: `headless windows --session <sess>` — check for modal dialogs
+6. Check `~/.cache/headlesslab/debug.log` — the CLI's own debug log
+7. Check `/tmp/wine_debug_<sess>.log` — the raw Wine log (may have more than `headless logs` shows)
+
+---
+
 ## 🔧 Environment Variables
 
 The `headless` CLI honors the following environment variables. Set them before
