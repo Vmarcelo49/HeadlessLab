@@ -19,6 +19,7 @@ Priority: `P0` (critical) → `P3` (nice to have).
 **Priority**: P0
 **Component**: `bin/headless` → `cmd_exec`
 **Affected versions**: v1.0.0
+**Resolved in**: v1.1.0 (commit pending)
 
 ### Summary
 
@@ -42,8 +43,7 @@ window but before `wait-window` is called.
 
 ### Expected behavior
 
-If the process exits within ~5 seconds of launch, `headless exec` should
-return:
+If the process exits within ~5 seconds, `headless exec` should return:
 ```json
 {
   "status": "error",
@@ -59,6 +59,37 @@ In `cmd_exec`, after `subprocess.Popen`, poll the process for up to 5 seconds
 using `proc.poll()`. If it returns non-None, read the log file and emit a
 `PROCESS_DIED` error with the tail. Also consider a `--wait` flag that blocks
 until either a window appears or the process dies.
+
+### Status
+
+**Fixed** in commit (pending push). The fix implements a polling loop with
+three crash detection signals:
+
+1. **bwrap exit**: `proc.poll()` returns non-None — the whole process tree is gone.
+2. **Log crash markers**: the Wine log contains "Unhandled page fault",
+   "access violation", "unhandled exception", or "wine: Unhandled". This
+   catches crashes even when Wine's `winedbg --auto` keeps zombie processes
+   alive.
+3. **No wine processes**: after the timeout, no wine processes are registered
+   under the prefix.
+
+A key refinement is the **grace period** (default 1.5s, configurable via
+`HEADLESS_EXEC_GRACE`): when a live user PID is first detected, the CLI does
+not immediately declare success. Instead it keeps polling the log for the
+grace period to catch crashes that take a moment to propagate. This is
+necessary because Wine keeps crashed EXE processes alive briefly while
+`winedbg --auto` attaches.
+
+The total wait time is configurable via `HEADLESS_EXEC_WAIT` (default 5s).
+The session is marked with `state: "crashed"` and `crash_reason` in the
+registry so `headless list` shows crashed sessions distinctly.
+
+Validated with a custom `crash_test.exe` (PE32 that dereferences NULL):
+- Before fix: `{"status": "ok", "pid": ..., "arch": "i386"}`
+- After fix: `{"status": "error", "code": "PROCESS_DIED", "message": "...log contains 'unhandled page fault'..."}`
+
+Also validated that working apps (zzcaster.exe, MBAA.exe) still return
+`{"status": "ok"}` correctly.
 
 ---
 

@@ -777,12 +777,151 @@ def cmd_exec(args):
     except Exception as e:
         print_error("LAUNCH_FAILED", f"Failed to launch process: {e}")
 
-    # Wait briefly and find surviving PID under this prefix
-    time.sleep(2)
-    pids = get_pids_for_prefix(wineprefix)
+    # Wait for the Wine process tree to stabilize and detect early crashes.
+    #
+    # The previous implementation waited a fixed 2 seconds and then checked
+    # /proc/{root_pid}. This was unreliable because:
+    #   1. bwrap (the parent) briefly outlives the wine child, so /proc/{pid}
+    #      exists even after the EXE has crashed.
+    #   2. Some apps take longer than 2s to crash (e.g. during D3D9 caps init).
+    #   3. The exit code of the bwrap wrapper was never consulted.
+    #   4. When an EXE crashes, Wine spawns winedbg --auto which keeps the
+    #      process tree alive even though the EXE itself is gone. The
+    #      get_pids_for_prefix() helper returns these zombie PIDs, making
+    #      the "is anything alive?" check pass falsely.
+    #
+    # The new implementation polls for up to HEADLESS_EXEC_WAIT seconds
+    # (default 5). On each iteration it checks:
+    #   - Whether bwrap has exited (proc.poll() is not None) -> definitive death
+    #   - Whether any "live" wine process (excluding winedbg/wineboot/winedevice)
+    #     is still running under this prefix
+    #   - Whether the log file contains "Unhandled page fault" or
+    #     "access violation" (strong crash signal even if winedbg holds the tree)
+    # If bwrap exits OR no live wine processes remain OR the log shows a crash,
+    # we treat it as a crash, read the log tail, and return PROCESS_DIED.
+    exec_wait = float(os.environ.get("HEADLESS_EXEC_WAIT", "5"))
+    deadline = time.time() + exec_wait
     root_pid = proc.pid
-    if pids:
-        # Pick the actual wine64 process (not winedevice/wineserver) when possible
+    pids = []
+    crashed = False
+    crash_reason = None
+    bwrap_exit_code = None
+
+    # Process name substrings that indicate a Wine helper, not the user's EXE.
+    # When only these are alive, the EXE itself has crashed.
+    WINE_HELPER_MARKERS = ("winedbg", "wineboot", "winedevice", "wineserver",
+                           "services.exe", "plugplay.exe", "explorer.exe",
+                           "rpcss.exe", "svchost.exe", "winemenubuilder.exe")
+
+    def _live_user_pids(prefix_pids):
+        """Filter prefix PIDs to only those that look like the user's EXE
+        (not Wine helper processes). Returns the filtered list."""
+        live = []
+        for p in prefix_pids:
+            try:
+                with open(f"/proc/{p}/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore").lower()
+            except Exception:
+                continue
+            # Skip Wine helper processes
+            if any(marker in cmdline for marker in WINE_HELPER_MARKERS):
+                continue
+            # Skip the bwrap wrapper itself
+            if "bwrap" in cmdline:
+                continue
+            live.append(p)
+        return live
+
+    def _log_shows_crash(path):
+        """Check the Wine log for strong crash signals."""
+        # Flush the log file buffer so we can read what Wine has written
+        # so far. Without this, the file object's buffer holds data that
+        # hasn't been written to disk yet, and our read misses it.
+        try:
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        except Exception:
+            pass
+        try:
+            with open(path, "r", errors="ignore") as f:
+                # Read only the last 8KB to stay fast
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 8192))
+                tail = f.read()
+            crash_markers = (
+                "unhandled page fault",
+                "access violation",
+                "unhandled exception",
+                "wine: Unhandled",
+            )
+            for marker in crash_markers:
+                if marker.lower() in tail.lower():
+                    return marker
+        except Exception:
+            pass
+        return None
+
+    # Grace period: when we first see a live user PID, we don't immediately
+    # declare success. Wine EXE processes can briefly appear alive even after
+    # crashing (winedbg --auto attaches and keeps the process tree around).
+    # We wait `grace_period` seconds (default 1.5s) after first seeing a live
+    # user PID, polling the log for a crash marker. If a crash appears during
+    # the grace period, we mark the session as crashed. If the grace period
+    # elapses with no crash marker, the app is genuinely running.
+    grace_period = float(os.environ.get("HEADLESS_EXEC_GRACE", "1.5"))
+    grace_deadline = None
+
+    while time.time() < deadline:
+        bwrap_exit_code = proc.poll()
+        if bwrap_exit_code is not None:
+            # bwrap has exited — the whole process tree is gone
+            crashed = True
+            crash_reason = f"bwrap exited with code {bwrap_exit_code}"
+            break
+
+        # Check log for crash (always — cheap and definitive)
+        marker = _log_shows_crash(log_path)
+        if marker:
+            crashed = True
+            crash_reason = f"log contains '{marker}'"
+            break
+
+        prefix_pids = get_pids_for_prefix(wineprefix)
+        if prefix_pids:
+            live_user = _live_user_pids(prefix_pids)
+            if live_user:
+                # We see a live user PID. But Wine EXE processes can briefly
+                # appear alive even after crashing (winedbg --auto attaches).
+                # Start a grace period: keep polling for `grace_period`
+                # seconds to see if a crash marker appears in the log.
+                if grace_deadline is None:
+                    grace_deadline = time.time() + grace_period
+                    # Keep polling; don't break yet
+                elif time.time() >= grace_deadline:
+                    # Grace period elapsed with no crash marker -> genuinely running
+                    pids = prefix_pids
+                    break
+                # else: still within grace period, keep polling
+            # else: only helpers, no user PID yet -> keep polling
+        time.sleep(0.2)
+    else:
+        # Loop exited via deadline (timeout). Do a final check.
+        marker = _log_shows_crash(log_path)
+        if marker:
+            crashed = True
+            crash_reason = f"log contains '{marker}' after {exec_wait}s timeout"
+        else:
+            prefix_pids = get_pids_for_prefix(wineprefix)
+            if prefix_pids:
+                # Live processes, no crash -> success (slow startup)
+                pids = prefix_pids
+            else:
+                crashed = True
+                crash_reason = f"no wine processes under prefix after {exec_wait}s"
+
+    # Pick the actual wine process (not winedevice/wineserver) when possible
+    if pids and not crashed:
         wine_main = None
         for p in pids:
             try:
@@ -795,18 +934,35 @@ def cmd_exec(args):
                 continue
         root_pid = wine_main or pids[0]
 
-    # Validate that the wine process survived — if it died, surface the error
-    if not os.path.exists(f"/proc/{root_pid}"):
-        # The bwrap may still be alive briefly; check it
-        if not os.path.exists(f"/proc/{proc.pid}"):
-            log_tail = ""
-            try:
-                with open(log_path, "r", errors="ignore") as f:
-                    log_tail = f.read()[-1500:]
-            except Exception:
-                pass
-            SessionRegistry.register(session_id, root_pid, display, wineprefix, log_path)
-            print_error("WINE_DIED", f"Wine process exited immediately. Log tail: {log_tail}")
+    # If we detected a crash, surface the error with the log tail.
+    # This is the core of BUG-001: never return "ok" when the process is dead.
+    if crashed or not os.path.exists(f"/proc/{root_pid}"):
+        log_tail = ""
+        try:
+            with open(log_path, "r", errors="ignore") as f:
+                log_tail = f.read()[-3000:]
+        except Exception:
+            pass
+        reason = crash_reason or "process not found in /proc"
+        # Register the session so the agent can call `headless logs` later
+        # to retrieve the full log if needed.
+        SessionRegistry.register(session_id, root_pid or proc.pid, display, wineprefix, log_path)
+        # Mark session as crashed for `headless list` visibility
+        try:
+            data = SessionRegistry._load()
+            if session_id in data["sessions"]:
+                data["sessions"][session_id]["state"] = "crashed"
+                data["sessions"][session_id]["exit_code"] = bwrap_exit_code
+                data["sessions"][session_id]["crash_reason"] = reason
+                SessionRegistry._save(data)
+        except Exception:
+            pass
+        print_error(
+            "PROCESS_DIED",
+            f"Wine process exited before stabilizing ({reason}; bwrap exit code: {bwrap_exit_code}). "
+            f"This usually means the EXE crashed on startup. "
+            f"Log tail (last 3000 chars):\n{log_tail}"
+        )
 
     # Write to registry
     SessionRegistry.register(session_id, root_pid, display, wineprefix, log_path)
