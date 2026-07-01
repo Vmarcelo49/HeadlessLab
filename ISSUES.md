@@ -209,19 +209,25 @@ honored but undocumented.
 
 **Priority**: P1
 **Component**: `bin/headless` → new command `click-text`
-**Status**: Open
+**Resolved in**: v1.2.0 (commit pending)
 
 **Summary**: `headless click <x> <y>` requires the caller to know pixel
 coordinates. To obtain them, an agent must screenshot, run OCR externally,
 do color-based region detection for low-contrast buttons, and compute
 bounding box centers — a 6-step pipeline reimplemented per session.
 
-**Expected behavior**: `headless click-text "<text>" --session <sess>`
-that performs OCR internally and clicks the center of the first match.
-Fallback strategy: full-screen OCR → 2x upscale → color-based button
-detection + per-button OCR.
+**Fix**: Added `headless click-text "<text>"` command with 3-tier OCR
+fallback strategy:
+1. Full-screen OCR with tesseract TSV bounding boxes (PSM 11)
+2. 2x upscale + retry (for small text)
+3. Color-based button detection + per-button OCR (for low-contrast buttons)
 
-**Dependencies**: Requires `tesseract-ocr` bundled in `host-debs/`.
+Supports `--index N` (which match to click), `--fuzzy` (partial match),
+`--dry-run` (return coordinates without clicking). Returns JSON with
+text, x, y, width, height, confidence, method, and clicked status.
+
+Validated with test image: "Training" found via strategy 1 (conf 96%),
+"Host" found via strategy 3 button_color (low-contrast red button).
 
 ---
 
@@ -262,15 +268,25 @@ override the default exe_dir behavior.
 
 **Priority**: P2
 **Component**: `bin/headless` → `cmd_exec`
-**Status**: Open
+**Resolved in**: v1.2.0 (commit pending)
 
 **Summary**: PE32 console-subsystem apps (e.g. `zzcaster.exe`) launched
 with plain `wine` don't get a Windows console, so `printf`/`cout` output
 goes nowhere. `headless logs` returns empty.
 
-**Expected behavior**: At minimum, emit a warning in the JSON response
-when `subsystem == 3` and `HEADLESS_USE_WINECONSOLE` is not set. The
-opt-in `HEADLESS_USE_WINECONSOLE=1` exists but defaults to off.
+**Fix**: `cmd_exec` now emits a `warning` field in the JSON response when
+`pe_subsystem == 3` and `HEADLESS_USE_WINECONSOLE` is not set:
+
+```json
+{
+  "status": "ok",
+  "session_id": "sess_xxx",
+  "pid": 1234,
+  "arch": "i386",
+  "subsystem": 3,
+  "warning": "Console-subsystem app launched without wineconsole. stdout/stderr may not be captured in 'headless logs'. Set HEADLESS_USE_WINECONSOLE=1 to enable a visible Wine console window."
+}
+```
 
 ---
 

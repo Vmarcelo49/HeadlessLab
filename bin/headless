@@ -1201,7 +1201,22 @@ def cmd_exec(args):
         sys.exit(2)
 
     # Report architecture so the agent knows whether the EXE ran as 32-bit or 64-bit
-    print_json({"status": "ok", "session_id": session_id, "pid": root_pid, "arch": pe_arch, "subsystem": pe_subsystem})
+    response = {"status": "ok", "session_id": session_id, "pid": root_pid, "arch": pe_arch, "subsystem": pe_subsystem}
+
+    # LIMITATION-004: Warn when launching a console-subsystem app without
+    # wineconsole. Console apps (subsystem 3) launched with plain 'wine'
+    # don't get a Windows console, so their printf/cout output is not
+    # captured to the log file. The agent should know to either set
+    # HEADLESS_USE_WINECONSOLE=1 for a visible console window, or accept
+    # that stdout/stderr won't appear in `headless logs`.
+    if pe_subsystem == 3 and os.environ.get("HEADLESS_USE_WINECONSOLE") != "1":
+        response["warning"] = (
+            "Console-subsystem app launched without wineconsole. "
+            "stdout/stderr may not be captured in 'headless logs'. "
+            "Set HEADLESS_USE_WINECONSOLE=1 to enable a visible Wine console window."
+        )
+
+    print_json(response)
 
 
 def _resolve_display(args, required_session=False):
@@ -1361,6 +1376,343 @@ def cmd_screenshot(args):
         response["unique_colors"] = unique_colors
     if warning:
         response["warning"] = warning
+    print_json(response)
+
+
+def _ocr_find_text(screenshot_path, target_text, fuzzy=False):
+    """Run tesseract OCR on a screenshot and find all occurrences of target_text.
+    Returns a list of dicts: {text, x, y, width, height, confidence, left, top}.
+    Uses PSM 11 (sparse text) with TSV output for bounding boxes.
+    """
+    import csv as _csv
+    import io as _io
+
+    target = target_text.lower().strip()
+    matches = []
+
+    # Run tesseract with TSV output
+    tsv_path = screenshot_path.replace(".png", "_tsv")
+    try:
+        result = subprocess.run(
+            ["tesseract", screenshot_path, tsv_path, "--psm", "11", "tsv"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return []
+    except Exception:
+        return []
+
+    tsv_file = tsv_path + ".tsv"
+    if not os.path.exists(tsv_file):
+        return []
+
+    try:
+        with open(tsv_file, "r", errors="replace") as f:
+            reader = _csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                if int(row.get("level", 0)) != 5:  # word level
+                    continue
+                text = row.get("text", "").lower().strip()
+                conf_str = row.get("conf", "0")
+                try:
+                    conf = float(conf_str)
+                except (ValueError, TypeError):
+                    conf = 0.0
+                if conf < 30:
+                    continue
+                if not text:
+                    continue
+                # Check match
+                if fuzzy:
+                    if target in text or text in target:
+                        pass  # match
+                    else:
+                        continue
+                else:
+                    if text != target:
+                        continue
+                try:
+                    left = int(row["left"])
+                    top = int(row["top"])
+                    width = int(row["width"])
+                    height = int(row["height"])
+                except (KeyError, ValueError):
+                    continue
+                matches.append({
+                    "text": row.get("text", ""),
+                    "x": left + width // 2,
+                    "y": top + height // 2,
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
+                    "confidence": conf,
+                })
+    except Exception:
+        pass
+    finally:
+        try:
+            os.remove(tsv_file)
+        except Exception:
+            pass
+
+    return matches
+
+
+def _ocr_find_text_in_buttons(screenshot_path, target_text, fuzzy=False):
+    """Fallback for low-contrast button text: detect colored button regions
+    via pixel analysis, crop each, upscale 3x, and OCR individually.
+    Returns same format as _ocr_find_text but with method="button_color".
+    """
+    try:
+        from PIL import Image
+        from collections import Counter
+    except ImportError:
+        return []
+
+    target = target_text.lower().strip()
+    matches = []
+
+    try:
+        img = Image.open(screenshot_path).convert("RGB")
+    except Exception:
+        return []
+
+    pixels = img.load()
+    W, H = img.size
+
+    # Find the dominant non-black, non-white color (likely button color)
+    color_counter = Counter()
+    for y in range(0, H, 4):
+        for x in range(0, W, 4):
+            p = pixels[x, y]
+            if p[0] > 40 or p[1] > 40 or p[2] > 40:  # non-black
+                if not (p[0] > 200 and p[1] > 200 and p[2] > 200):  # non-white
+                    color_counter[p] += 1
+
+    if not color_counter:
+        return []
+
+    # Try top 3 colors as potential button colors
+    for btn_color, _ in color_counter.most_common(3):
+        r, g, b = btn_color
+        tolerance = 50
+
+        # Find horizontal bands of this color
+        color_rows = {}
+        for y in range(H):
+            count = 0
+            for x in range(0, W, 2):
+                p = pixels[x, y]
+                if (abs(p[0]-r) < tolerance and abs(p[1]-g) < tolerance
+                        and abs(p[2]-b) < tolerance):
+                    count += 1
+            if count > 20:
+                color_rows[y] = count
+
+        # Group consecutive rows into bands
+        bands = []
+        current_band = []
+        for y in sorted(color_rows.keys()):
+            if not current_band or y == current_band[-1] + 1:
+                current_band.append(y)
+            else:
+                if len(current_band) > 8:
+                    bands.append(current_band)
+                current_band = [y]
+        if current_band and len(current_band) > 8:
+            bands.append(current_band)
+
+        # OCR each button band
+        for band in bands:
+            y_start = max(0, band[0] - 5)
+            y_end = min(H, band[-1] + 5)
+            mid_y = (y_start + y_end) // 2
+            x_start = W
+            x_end = 0
+            for x in range(W):
+                p = pixels[x, mid_y]
+                if (abs(p[0]-r) < tolerance and abs(p[1]-g) < tolerance
+                        and abs(p[2]-b) < tolerance):
+                    if x < x_start:
+                        x_start = x
+                    if x > x_end:
+                        x_end = x
+            if x_end <= x_start:
+                continue
+            x_start = max(0, x_start - 30)
+            x_end = min(W, x_end + 30)
+
+            # Crop button area (with padding above for text)
+            button_crop = img.crop((x_start, max(0, y_start - 30), x_end, y_end))
+            if button_crop.width < 10 or button_crop.height < 5:
+                continue
+            # Upscale 3x for OCR
+            button_big = button_crop.resize(
+                (button_crop.width * 3, button_crop.height * 3),
+                Image.LANCZOS
+            )
+            tmp_path = f"/tmp/btn_ocr_{y_start}_{x_start}.png"
+            try:
+                button_big.save(tmp_path)
+            except Exception:
+                continue
+
+            # OCR with PSM 7 (single line of text)
+            try:
+                r2 = subprocess.run(
+                    ["tesseract", tmp_path, "stdout", "--psm", "7"],
+                    capture_output=True, text=True, timeout=10
+                )
+                btn_text = r2.stdout.strip().lower()
+            except Exception:
+                btn_text = ""
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+            if not btn_text:
+                continue
+
+            # Check match
+            matched = False
+            if fuzzy:
+                if target in btn_text or btn_text in target:
+                    matched = True
+            else:
+                if target == btn_text:
+                    matched = True
+
+            if matched:
+                matches.append({
+                    "text": r2.stdout.strip(),
+                    "x": (x_start + x_end) // 2,
+                    "y": (y_start + y_end) // 2,
+                    "left": x_start,
+                    "top": y_start,
+                    "width": x_end - x_start,
+                    "height": y_end - y_start,
+                    "confidence": 50.0,
+                    "method": "button_color",
+                    "button_color": [r, g, b],
+                })
+
+    return matches
+
+
+def cmd_click_text(args):
+    """Find text on screen via OCR and click on it.
+
+    Uses tesseract OCR with TSV output to find the bounding box of the
+    requested text, then clicks at the center. Fallback strategy:
+    1. Full-screen OCR with TSV bounding boxes (PSM 11)
+    2. Upscale 2x and retry (for small text)
+    3. Color-based button detection + per-button OCR (for low-contrast text)
+    """
+    target_text = args.text
+    fuzzy = getattr(args, "fuzzy", False)
+    index = getattr(args, "index", 1) - 1  # 0-based
+    dry_run = getattr(args, "dry_run", False)
+
+    display = _resolve_display(args, required_session=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    # Take a screenshot
+    screenshot_path = f"/tmp/click_text_{int(time.time())}.png"
+    import_bin = shutil.which("import")
+    if import_bin:
+        try:
+            subprocess.run([import_bin, "-window", "root", screenshot_path],
+                          env=env, check=True, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print_error("SCREENSHOT_FAILED", f"Could not capture screen for OCR: {e}")
+    else:
+        print_error("SCREENSHOT_FAILED", "ImageMagick 'import' not found")
+
+    # Strategy 1: Full-screen OCR
+    matches = _ocr_find_text(screenshot_path, target_text, fuzzy=fuzzy)
+
+    # Strategy 2: Upscale 2x and retry
+    if not matches:
+        try:
+            from PIL import Image
+            img = Image.open(screenshot_path).convert("RGB")
+            img_big = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+            big_path = screenshot_path.replace(".png", "_2x.png")
+            img_big.save(big_path)
+            big_matches = _ocr_find_text(big_path, target_text, fuzzy=fuzzy)
+            # Scale coordinates back to original resolution
+            for m in big_matches:
+                m["x"] //= 2
+                m["y"] //= 2
+                m["left"] //= 2
+                m["top"] //= 2
+                m["width"] //= 2
+                m["height"] //= 2
+                m["method"] = "ocr_2x"
+            matches = big_matches
+            try:
+                os.remove(big_path)
+            except Exception:
+                pass
+        except ImportError:
+            pass
+
+    # Strategy 3: Color-based button detection
+    if not matches:
+        btn_matches = _ocr_find_text_in_buttons(screenshot_path, target_text, fuzzy=fuzzy)
+        matches = btn_matches
+
+    # Clean up screenshot
+    try:
+        os.remove(screenshot_path)
+    except Exception:
+        pass
+
+    if not matches:
+        print_error(
+            "TEXT_NOT_FOUND",
+            f"Text '{target_text}' not found on screen via OCR. "
+            f"Try --fuzzy for partial matching, or check that the text is visible "
+            f"(use 'headless screenshot' to verify)."
+        )
+
+    if index >= len(matches):
+        print_error(
+            "INDEX_OUT_OF_RANGE",
+            f"Found {len(matches)} matches for '{target_text}', but index {index+1} requested. "
+            f"Matches found: {[m['text'] for m in matches[:10]]}"
+        )
+
+    match = matches[index]
+
+    # Click at the center
+    if not dry_run:
+        try:
+            subprocess.run(
+                ["xdotool", "mousemove", str(match["x"]), str(match["y"]), "click", "1"],
+                env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print_error("CLICK_FAILED", f"Found text but click failed: {e}")
+
+    response = {
+        "status": "ok",
+        "text": match["text"],
+        "x": match["x"],
+        "y": match["y"],
+        "width": match["width"],
+        "height": match["height"],
+        "confidence": match["confidence"],
+        "method": match.get("method", "ocr"),
+        "clicked": not dry_run,
+    }
+    if "button_color" in match:
+        response["button_color"] = match["button_color"]
     print_json(response)
 
 
@@ -2129,6 +2481,22 @@ def main():
     parser_click.add_argument("--session", help="Session ID (required if multiple sessions active)")
     parser_click.add_argument("--display", help="X11 display (alternative to --session)")
 
+    # Command: click-text
+    parser_click_text = subparsers.add_parser("click-text",
+        help="Find text on screen via OCR and click on it",
+        description="Capture a screenshot, run OCR (tesseract) to find the target text, and click at the center of its bounding box. Falls back to 2x upscale and color-based button detection for low-contrast text.",
+        epilog='Examples:\n  headless click-text "Training" --session sess_...\n  headless click-text "OK" --session sess_... --index 2\n  headless click-text "Cancel" --session sess_... --fuzzy\n  headless click-text "Save" --session sess_... --dry-run\n  → {"status":"ok","text":"Training","x":1219,"y":537,"width":280,"height":44,"confidence":93.5,"method":"ocr","clicked":true}',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_click_text.add_argument("text", help="Text to find and click (case-insensitive)")
+    parser_click_text.add_argument("--session", help="Session ID (required if multiple sessions active)")
+    parser_click_text.add_argument("--display", help="X11 display (alternative to --session)")
+    parser_click_text.add_argument("--index", type=int, default=1,
+        help="Which match to click if multiple (1-based, default: 1)")
+    parser_click_text.add_argument("--fuzzy", action="store_true",
+        help="Partial match: target is substring of detected text or vice versa")
+    parser_click_text.add_argument("--dry-run", action="store_true",
+        help="Find text and return coordinates without clicking")
+
     # Command: key
     parser_key = subparsers.add_parser("key",
         help="Press a key (KeySym name)",
@@ -2228,6 +2596,7 @@ def main():
         "exec": cmd_exec,
         "screenshot": cmd_screenshot,
         "click": cmd_click,
+        "click-text": cmd_click_text,
         "key": cmd_key,
         "type": cmd_type,
         "logs": cmd_logs,
