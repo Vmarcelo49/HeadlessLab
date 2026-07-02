@@ -666,6 +666,11 @@ def cmd_exec(args):
         # Wine 11's new WoW64 (PE-only) handles 32-bit PE WITHOUT needing
         # 32-bit ELF wine binary, ld-linux.so.2, or i386-unix .so files.
         "--ro-bind", wine_dir, "/opt/wine-devel",
+        # GStreamer plugins from ~/.local (extracted from .deb, no sudo needed).
+        # MBAACC needs decodebin + mpeg2dec to play intro videos.
+        # Mount user's local gstreamer plugins so winegstreamer.dll can find them.
+        "--ro-bind", os.path.expanduser("~/.local/usr/lib/x86_64-linux-gnu/gstreamer-1.0"), "/usr/lib/x86_64-linux-gnu/gstreamer-1.0-user",
+        "--symlink", "/usr/lib/x86_64-linux-gnu/gstreamer-1.0-user", "/usr/lib/x86_64-linux-gnu/gstreamer-1.0-user-link",
         "--proc", "/proc",
         "--dev", "/dev"
     ]
@@ -677,6 +682,10 @@ def cmd_exec(args):
     env["VK_ICD_FILENAMES"] = "/usr/share/vulkan/icd.d/lvp_icd.json"
     env["WINEDEBUG"] = "-all"
     env["PATH"] = "/opt/wine-devel/bin:/usr/bin:/bin"
+    # GStreamer plugins: prepend user-installed plugins (extracted from .deb)
+    # so winegstreamer.dll can find decodebin + mpeg2dec etc.
+    env["GST_PLUGIN_PATH"] = "/usr/lib/x86_64-linux-gnu/gstreamer-1.0-user:/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
+    env["GST_PLUGIN_SYSTEM_PATH"] = "/usr/lib/x86_64-linux-gnu/gstreamer-1.0-user:/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
 
     # Initialize wineprefix — use a template approach for speed and reliability.
     # Wine 11's wineboot hangs in bwrap (takes 30s+ and often doesn't complete).
